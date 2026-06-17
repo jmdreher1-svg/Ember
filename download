@@ -1,0 +1,8 @@
+# Copy this file to ".env" and fill in your key.
+# The key is read only by the server (server.js) and is never sent to the browser.
+
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+
+# Optional overrides:
+# ANTHROPIC_MODEL=claude-sonnet-4-6
+# PORT=8787
