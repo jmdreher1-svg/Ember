@@ -5,7 +5,17 @@ A self-contained build of EMBER that runs on your own machine or server, with no
 dependency on the Claude.ai runtime. It includes:
 
 - the full EMBER frontend (Hazen-Williams nodal solver, gridded loops, US/metric,
-  CMDA/CMSA/ESFR, density/area auto-calc, pump & hydrant supply records, branded PDF export);
+  CMDA/CMSA/ESFR, density/area auto-calc, pump & hydrant supply records);
+- a **parametric Sizer** that lays out the whole system (branch lines × heads,
+  branch/line spacing) and auto-selects the most-remote operating area from a
+  selectable NFPA remote-area factor (1.0 / 1.2 / 1.4), highlighting it on the
+  editable plan view;
+- **PDF export in two styles**, chosen from the dropdown next to *Export PDF*:
+  - **NFPA worksheet** — the AHJ-standard HydraCALC-style report: title page,
+    N^1.85 water-supply/demand curve, the node-to-node *Final Calculations:
+    Hazen-Williams* worksheet, *Flow Summary* (supply + node analysis), and the
+    fittings legend;
+  - **Branded report** — a modern letterhead summary with the plan-view drawing;
 - a small **AI proxy** so the "AI review" tab works while keeping your Anthropic
   API key on the server (never exposed to the browser);
 - an on-disk **persistence layer** so Save / Load stores projects as files you own.
@@ -76,9 +86,10 @@ helpers in `server.js` (`/api/projects` routes) — the frontend contract won't 
 
 - **Hydraulics, schematic, results, Save/Load** — fully local, no internet needed.
 - **AI review** — needs internet + a valid API key (it calls Anthropic via the proxy).
-- **PDF export** — loads the jsPDF library from a CDN at click time, so it needs
-  internet on first use. For a fully air-gapped setup, self-host jsPDF and
-  jspdf-autotable and point `ensurePdfLibs()` in `App.jsx` at the local copies.
+- **PDF export** (both the NFPA worksheet and the branded report) — loads the
+  jsPDF library from a CDN at click time, so it needs internet on first use. For
+  a fully air-gapped setup, self-host jsPDF and jspdf-autotable and point
+  `ensurePdfLibs()` in `App.jsx` at the local copies.
 
 ## Security notes (read before exposing it beyond your machine)
 
