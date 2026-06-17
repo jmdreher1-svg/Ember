@@ -39,6 +39,22 @@ import {
    [ ] Multiple supply sources / tanks.
    [ ] CSV / Excel export of node & pipe tables.
    [ ] Logo image upload for the PDF letterhead.
+
+   IDEAS TO BEAT HYDRACALC (candidate differentiators)
+   ---------------------------------------------------
+   [x] NFPA-worksheet PDF (HydraCALC-style) export — title page, N^1.85 supply
+       curve, node-to-node Hazen-Williams worksheet, flow summary, fittings.
+   [x] Whole-system Sizer with a selectable remote-area factor (1.0/1.2/1.4)
+       that auto-flags the operating area and highlights it on the plan.
+   [ ] Live, real-time solve (already instant) + side-by-side scenario compare
+       (e.g. wet vs dry +30% area, K=5.6 vs K=8.0) in one report.
+   [ ] One-click code checks: velocity limits, max pressure (175 psi), C-factor
+       per material, hose/inside-hose allowances by occupancy — with pass/fail.
+   [ ] AI design review + plain-language plan-reviewer narrative (already wired).
+   [ ] Peaking/auto-balance optimizer that minimizes pipe cost ($/ft catalog)
+       instead of just velocity — true least-cost sizing.
+   [ ] Cloud projects, shareable links, versioned revisions & audit trail.
+   [ ] Import: .wxf/.sdf (HydraCALC), .dxf backgrounds, CAD round-trip.
    ============================================================ */
 
 /* ---------- Standalone / runtime config ----------
@@ -317,10 +333,68 @@ function analyze(project) {
 
   return {
     ok: true, looped, disconnected, ids, N, srcId, edges, geom,
-    P: sol.P, Pn: sol.Pn, spr: sol.spr, requiredPs, totalQ, pipeRows, activeSpr, minP,
+    P: sol.P, Pn: sol.Pn, spr: sol.spr, HGL: sol.HGL, requiredPs, totalQ, pipeRows, activeSpr, minP,
     velocityPressure: opts.velocityPressure,
     supply: { availAt, demandQ, pAvail, margin },
   };
+}
+
+/* ---------- Node path (NFPA "Final Calculations" ordering) ----------
+   Trace each flow path from the most-remote sprinkler back toward the supply,
+   exactly as a hand calc / HydraCALC worksheet walks the network. Returns
+   ordered "blocks" (one contiguous remote→supply run each), so the worksheet
+   prints branch by branch and the running total pressure ties to the solver. */
+function nodePath(res) {
+  if (!res?.ok || !res.edges?.length || !res.HGL) return null;
+  const { ids, srcId, edges, N, HGL } = res;
+  const adj = Object.fromEntries(ids.map((id) => [id, []]));
+  edges.forEach((e) => { adj[e.a].push({ o: e.b, e }); adj[e.b].push({ o: e.a, e }); });
+  // spanning tree from the source (parent = the neighbor one step closer to supply)
+  const depth = { [srcId]: 0 }, parent = {}, parentEdge = {}, seen = new Set([srcId]), q = [srcId];
+  while (q.length) {
+    const u = q.shift();
+    for (const { o, e } of adj[u]) if (!seen.has(o)) { seen.add(o); depth[o] = depth[u] + 1; parent[o] = u; parentEdge[o] = e; q.push(o); }
+  }
+  const flowOf = (e) => { const u = HGL[e.a] - HGL[e.b]; return Math.sign(u) * Math.pow(Math.max(Math.abs(u), 1e-12) / e.g.R, M); };
+  // deepest nodes first → start each path at a remote tip
+  const order = ids.filter((id) => id !== srcId && seen.has(id)).sort((a, b) => depth[b] - depth[a]);
+  const emitted = new Set();
+  const blocks = [];
+  for (const start of order) {
+    if (!parentEdge[start] || emitted.has(parentEdge[start].id)) continue;
+    let cur = start; const segs = []; let prevQt = 0;
+    while (cur !== srcId && parentEdge[cur] && !emitted.has(parentEdge[cur].id)) {
+      const e = parentEdge[cur]; emitted.add(e.id);
+      const up = parent[cur];                         // node one step toward the supply
+      const Qt = Math.abs(flowOf(e));
+      const isLeaf = segs.length === 0;
+      const Qa = isLeaf ? (res.spr[cur] || Qt) : Qt - prevQt; // flow picked up at this node
+      segs.push({ from: cur, to: up, e, Qt, Qa });
+      prevQt = Qt; cur = up;
+    }
+    if (segs.length) blocks.push({ segs, tie: cur });  // tie = where it joined an existing path (or the source)
+  }
+  return { blocks, depth, parent, parentEdge, flowOf };
+}
+
+/* Key points for the NFPA water-supply / demand graph (N^1.85 scale).
+   C1/C2 = supply test points · D1 = elevation, D2 = system, D3 = system+hose. */
+function supplyCurvePoints(res, project) {
+  const s = project.supply;
+  const availAt = supplyAvailFn(s);
+  const staticP = availAt(0);
+  const testFlow = s.type === "pump" ? s.pump.suctionTestFlow : s.testFlow;
+  const testRes = availAt(testFlow);
+  const demand = res?.ok && !res.noDemand ? res : null;
+  let d1Elev = 0, d2Flow = 0, d2P = 0, d3Flow = 0, margin = null;
+  if (demand) {
+    const srcZ = res.N[res.srcId]?.z || 0;
+    const elevs = res.activeSpr.map((sp) => res.N[sp.id]?.z ?? srcZ);
+    d1Elev = EHEAD * (Math.max(srcZ, ...(elevs.length ? elevs : [srcZ])) - srcZ);
+    d2Flow = res.totalQ; d2P = res.requiredPs;
+    d3Flow = res.supply.demandQ; margin = res.supply.margin;
+  }
+  return { availAt, staticP, testFlow, testRes, d1Elev, d2Flow, d2P, d3Flow, margin, hasDemand: !!demand };
 }
 
 /* ---------- Schematic layout (general graph via BFS) ---------- */
@@ -642,6 +716,371 @@ async function exportPDF(project, res, sys) {
 }
 
 /* ============================================================
+   NFPA / HydraCALC-STYLE WORKSHEET PDF
+   The format AHJs and plan reviewers expect: title page, water-supply
+   curve, the node-to-node "Final Calculations: Hazen-Williams" worksheet,
+   a flow summary (supply + node analysis), and the fittings legend.
+   ============================================================ */
+// NFPA fitting legend abbreviations, keyed to EMBER's FITTINGS map.
+const FIT_ABBR = { e90: "E", e45: "F", tee: "T", gate: "G", bfly: "BV", chk: "S" };
+const FIT_NAME = {
+  e90: "90° Standard Elbow", e45: "45° Elbow", tee: "90° Flow thru Tee",
+  gate: "Gate Valve", bfly: "Butterfly Valve", chk: "Swing Check",
+};
+
+async function exportHydraCalcPDF(project, res, sys) {
+  await ensurePdfLibs();
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
+  const PW = doc.internal.pageSize.getWidth();   // 612
+  const PH = doc.internal.pageSize.getHeight();  // 792
+  const ML = 40, MR = PW - 40;
+  const INK = [20, 20, 20], GRAY = [110, 110, 110], LINE = [180, 180, 180];
+  const fmt = (q, v, dec) => (v == null || isNaN(v) ? "" : toDisp(sys, q, v).toFixed(dec ?? UPREC[sys][q]));
+  const U = (q) => lab(sys, q);
+  const company = project.company || "DGA Consulting";
+  const job = project.name || "Hydraulic Calculation";
+  const dateStr = project.reportDate || today();
+  let pageNo = 0;
+
+  /* shared page header on every content page (title + company/job + page/date) */
+  const startPage = (title, first = false) => {
+    if (!first) doc.addPage();
+    pageNo += 1;
+    doc.setTextColor(...INK);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(15);
+    doc.text(title, ML, 44);
+    doc.setDrawColor(...LINE); doc.setLineWidth(0.6); doc.line(ML, 52, MR, 52);
+    doc.setFontSize(9);
+    doc.text(company, ML, 66);
+    doc.text(job, ML, 78);
+    doc.text("Page", MR - 78, 66); doc.text(String(pageNo), MR - 44, 66);
+    doc.text("Date", MR - 78, 78); doc.text(dateStr, MR - 44, 78);
+    doc.setLineWidth(1.4); doc.line(ML, 86, MR, 86);
+    doc.setLineWidth(0.5);
+    return 104; // first content y
+  };
+  const footer = (revLike) => {
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...GRAY);
+    doc.text(revLike || "Hydraulic Calculations by EMBER  ·  DGA Consulting", PW / 2, PH - 28, { align: "center" });
+    doc.setTextColor(...INK);
+  };
+
+  /* ---------- 1 · COVER ---------- */
+  pageNo = 1;
+  // EMBER wordmark / flame glyph
+  doc.setDrawColor(234, 88, 12); doc.setLineWidth(2.4);
+  doc.setFillColor(234, 88, 12);
+  // simple flame: a rounded triangle
+  doc.triangle(PW / 2 - 22, 188, PW / 2 + 22, 188, PW / 2, 120, "F");
+  doc.setFillColor(255, 170, 80);
+  doc.triangle(PW / 2 - 11, 188, PW / 2 + 11, 188, PW / 2, 150, "F");
+  doc.setTextColor(...INK);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(30);
+  doc.text("EMBER", PW / 2, 232, { align: "center" });
+  doc.setFont("helvetica", "normal"); doc.setFontSize(15);
+  doc.text("Hydraulic Calculations", PW / 2, 256, { align: "center" });
+
+  // contractor box
+  const cbX = PW / 2 - 150, cbW = 300;
+  doc.setDrawColor(...INK); doc.setLineWidth(1);
+  doc.rect(cbX, 300, cbW, 70);
+  doc.setFontSize(11);
+  doc.text(company, cbX + 16, 324);
+  doc.setFontSize(10); doc.setTextColor(...GRAY);
+  doc.text(project.location || "Mechanicsburg, PA 17055", cbX + 16, 340);
+  doc.text(project.preparedBy ? `Prepared by: ${project.preparedBy}` : "Fire Protection Engineering", cbX + 16, 356);
+  doc.setTextColor(...INK);
+
+  // job info box
+  const jbX = PW / 2 - 210, jbW = 420, jbY = 430;
+  doc.rect(jbX, jbY, jbW, 132);
+  const info = [
+    ["Job Name", job],
+    ["Drawing", project.drawingNumber || ""],
+    ["Location", project.location || ""],
+    ["Remote Area", project.systemType === "CMDA" && project.design.mode === "density"
+      ? `${fmt("area", project.design.designArea)} ${U("area")}  (factor ${project.sizer?.remoteAreaFactor ?? 1.2})` : ""],
+    ["Contract", project.projectNumber || ""],
+    ["Data File", project.name ? `${project.name}.ember` : ""],
+    ["Date/Time", `${dateStr}`],
+  ];
+  doc.setFontSize(10);
+  let iy = jbY + 22;
+  info.forEach(([k, v]) => {
+    doc.setFont("helvetica", "bold"); doc.text(k, jbX + 16, iy);
+    doc.setFont("helvetica", "normal"); doc.text(":", jbX + 96, iy);
+    doc.text(String(v || ""), jbX + 104, iy);
+    iy += 16;
+  });
+  footer("Hydraulic Calculations by EMBER  ·  DGA Consulting fire-protection engine");
+
+  /* ---------- 2 · WATER SUPPLY CURVE ---------- */
+  if (res?.ok) {
+    let yy = startPage("Water Supply Curve");
+    const sp = supplyCurvePoints(res, project);
+    const s = project.supply;
+    // info boxes
+    doc.setFontSize(9.5); doc.setFont("helvetica", "bold");
+    doc.text("City Water Supply:", ML + 6, yy);
+    doc.setFont("helvetica", "normal");
+    const cwl = [
+      [`C1 - Static Pressure`, fmt("pressure", sp.staticP)],
+      [`C2 - Residual Pressure`, fmt("pressure", sp.testRes)],
+      [`C2 - Residual Flow`, fmt("flow", sp.testFlow)],
+    ];
+    cwl.forEach(([k, v], i) => { doc.text(k, ML + 18, yy + 14 + i * 13); doc.text(`: ${v}`, ML + 150, yy + 14 + i * 13); });
+    doc.setFont("helvetica", "bold");
+    doc.text("Demand:", PW / 2 + 40, yy);
+    doc.setFont("helvetica", "normal");
+    const dml = [
+      [`D1 - Elevation`, fmt("pressure", sp.d1Elev)],
+      [`D2 - System Flow`, fmt("flow", sp.d2Flow)],
+      [`D2 - System Pressure`, fmt("pressure", sp.d2P)],
+      [`Hose ( Demand )`, fmt("flow", s.hose)],
+      [`D3 - System Demand`, fmt("flow", sp.d3Flow)],
+      [`Safety Margin`, sp.margin == null ? "" : fmt("pressure", sp.margin)],
+    ];
+    dml.forEach(([k, v], i) => { doc.text(k, PW / 2 + 52, yy + 14 + i * 13); doc.text(`: ${v}`, PW / 2 + 180, yy + 14 + i * 13); });
+
+    // graph box
+    const gx = ML + 30, gy = yy + 100, gw = MR - gx - 8, gh = PH - gy - 70;
+    const flowD = (v) => toDisp(sys, "flow", v), pD = (v) => toDisp(sys, "pressure", v);
+    const maxP = Math.max(niceTicks(pD(Math.max(sp.staticP, sp.d2P, 10)) * 1.05)[Math.max(1, niceTicks(pD(Math.max(sp.staticP, sp.d2P, 10)) * 1.05).length - 1)] || 150, pD(sp.staticP) * 1.1);
+    const pTicks = niceTicks(maxP, 10);
+    const pTop = pTicks[pTicks.length - 1] || maxP;
+    const maxQd = Math.max(flowD(sp.testFlow) * 1.05, flowD(sp.d3Flow) * 1.25, 100);
+    const qTicks = niceTicks(maxQd, 9);
+    const qTop = Math.pow(qTicks[qTicks.length - 1] || maxQd, HW_N);
+    const PX = (qDisp) => gx + (Math.pow(Math.max(qDisp, 0), HW_N) / qTop) * gw;
+    const PY = (pDisp) => gy + gh - (Math.max(pDisp, 0) / pTop) * gh;
+    // grid + axes
+    doc.setDrawColor(...LINE); doc.setLineWidth(0.4);
+    doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+    pTicks.forEach((t) => { const y = PY(t); doc.line(gx, y, gx + gw, y); doc.text(String(Math.round(t)), gx - 6, y + 2.5, { align: "right" }); });
+    let lastTx = -99;
+    qTicks.forEach((t) => { if (t <= 0) return; const x = PX(t); doc.line(x, gy, x, gy + gh); if (x - lastTx >= 22) { doc.text(String(Math.round(t)), x, gy + gh + 12, { align: "center" }); lastTx = x; } });
+    doc.setDrawColor(...INK); doc.setLineWidth(1); doc.rect(gx, gy, gw, gh);
+    doc.setTextColor(...INK); doc.setFontSize(8.5);
+    doc.text(`FLOW ( ${U("flow")} ) — N^1.85 scale`, gx + gw / 2, gy + gh + 28, { align: "center" });
+    // supply line (sample availAt across the range)
+    doc.setDrawColor(...INK); doc.setLineWidth(1.1);
+    let prev = null;
+    for (let i = 0; i <= 40; i++) {
+      const q = (sp.testFlow * 1.6 / 40) * i;
+      const pt = { x: PX(flowD(q)), y: PY(pD(sp.availAt(q))) };
+      if (prev) doc.line(prev.x, prev.y, pt.x, pt.y);
+      prev = pt;
+    }
+    const mark = (qDisp, pDisp, tag, dx = 4, dy = -4) => {
+      const x = PX(qDisp), y = PY(pDisp);
+      doc.setDrawColor(...INK); doc.setLineWidth(0.8);
+      doc.circle(x, y, 2.4, "S");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(8.5);
+      doc.text(tag, x + dx, y + dy);
+      doc.setFont("helvetica", "normal");
+    };
+    mark(flowD(0), pD(sp.staticP), "C1");
+    mark(flowD(sp.testFlow), pD(sp.testRes), "C2");
+    if (sp.hasDemand) {
+      // demand line D1 → D2
+      doc.setDrawColor(...INK); doc.setLineWidth(0.9);
+      doc.line(PX(flowD(0)), PY(pD(sp.d1Elev)), PX(flowD(sp.d2Flow)), PY(pD(sp.d2P)));
+      mark(flowD(0), pD(sp.d1Elev), "D1", 4, 10);
+      mark(flowD(sp.d2Flow), pD(sp.d2P), "D2");
+      mark(flowD(sp.d3Flow), pD(sp.d2P), "D3", 4, 12);
+    }
+    footer();
+  }
+
+  /* ---------- 3 · FINAL CALCULATIONS : HAZEN-WILLIAMS ---------- */
+  const path = nodePath(res);
+  if (res?.ok && !res.noDemand && path) {
+    const pipeById = Object.fromEntries((project.pipes || []).map((p) => [p.id, p]));
+    // column anchors (pt). number columns right-aligned at the x given.
+    const C = { node: ML, elev: ML + 50, kfac: ML + 122, q: ML + 178, nom: ML + 188, fit: ML + 224,
+      equiv: ML + 296, plt: ML + 354, cf: ML + 398, ppf: ML + 446, note: ML + 452 };
+    const RH = 11; // row height
+    let yy = startPage("Final Calculations : Hazen-Williams");
+    const colHead = () => {
+      doc.setFont("helvetica", "bold"); doc.setFontSize(7.6); doc.setTextColor(...INK);
+      const r1 = yy, r2 = yy + 9, r3 = yy + 18;
+      doc.text("Node1", C.node, r1); doc.text("to", C.node, r2); doc.text("Node2", C.node, r3);
+      doc.text("Elev1", C.elev, r1); doc.text("Elev2", C.elev, r3);
+      doc.text("K", C.kfac, r1, { align: "right" }); doc.text("Fact", C.kfac, r3, { align: "right" });
+      doc.text("Qa", C.q, r1, { align: "right" }); doc.text("Qt", C.q, r3, { align: "right" });
+      doc.text("Nom", C.nom, r1); doc.text("Act", C.nom, r3);
+      doc.text("Fitting", C.fit, r1); doc.text("or", C.fit, r2); doc.text("Eqiv", C.fit, r3);
+      doc.text("Pipe", C.plt, r1, { align: "right" }); doc.text("Ftngs", C.plt, r2, { align: "right" }); doc.text("Total", C.plt, r3, { align: "right" });
+      doc.text("Len", C.equiv, r3, { align: "right" });
+      doc.text("CFact", C.cf, r1, { align: "right" }); doc.text("Pf/Ft", C.cf, r3, { align: "right" });
+      doc.text("Pt", C.ppf, r1, { align: "right" }); doc.text("Pe", C.ppf, r2, { align: "right" }); doc.text("Pf", C.ppf, r3, { align: "right" });
+      doc.text("Notes", C.note + 22, r2);
+      yy = r3 + 6;
+      doc.setLineWidth(1.2); doc.setDrawColor(...INK); doc.line(ML, yy, MR, yy); yy += 12;
+      doc.setFont("courier", "normal"); doc.setFontSize(7.4);
+    };
+    colHead();
+    const ensure = (h) => { if (yy + h > PH - 56) { footer(); yy = startPage("Final Calculations : Hazen-Williams"); colHead(); } };
+    const R = (x, y, t) => { if (t !== "" && t != null) doc.text(String(t), x, y, { align: "right" }); };
+    const L = (x, y, t) => { if (t !== "" && t != null) doc.text(String(t), x, y); };
+
+    for (const block of path.blocks) {
+      for (const seg of block.segs) {
+        ensure(RH * 3 + 4);
+        const e = seg.e, pp = pipeById[e.id];
+        const n1 = seg.from, n2 = seg.to;
+        const z1 = res.N[n1].z, z2 = res.N[n2].z;
+        const g = e.g;
+        const Qt = seg.Qt, Qa = seg.Qa;
+        // fittings present on this pipe
+        const fitList = [];
+        for (const k in FITTINGS) {
+          const cnt = pp?.fittings?.[k] || 0;
+          if (cnt > 0) { const each = FITTINGS[k].vals[pp.sizeIdx] * fittingFactor(pp.C); fitList.push({ ab: (cnt > 1 ? cnt : "") + FIT_ABBR[k], eq: cnt * each }); }
+        }
+        const ftngsTot = fitList.reduce((a, f) => a + f.eq, 0);
+        const pipeLen = pp ? pp.length : (g.Lt - g.adjEquiv);
+        const Pt1 = res.P[n1], Pt2 = res.P[n2];
+        const Pe = EHEAD * (z1 - z2);
+        const Pf = g.R * Math.pow(Qt, HW_N);
+        const PfFt = g.Lt > 0 ? Pf / g.Lt : 0;
+        const vel = velocity(Qt, g.d);
+        const y1 = yy, y2 = yy + RH, y3 = yy + RH * 2;
+        // row 1
+        L(C.node, y1, res.N[n1].label);
+        R(C.elev, y1, fmt("length", z1, 0));
+        R(C.kfac, y1, res.N[n1].type === "sprinkler" ? fmt("kfac", res.N[n1].k) : "");
+        R(C.q, y1, fmt("flow", Math.abs(Qa) < 5e-3 ? 0 : Qa, 2));
+        L(C.nom, y1, pp ? SCHED40[pp.sizeIdx].nom.replace(/"/g, "") : g.d.toFixed(2));
+        if (fitList[0]) { L(C.fit, y1, fitList[0].ab); R(C.equiv, y1, fitList[0].eq.toFixed(3)); }
+        R(C.plt, y1, fmt("length", pipeLen, 3));
+        R(C.cf, y1, pp ? pp.C : g.C);
+        R(C.ppf, y1, fmt("pressure", Pt1, 3));
+        // row 2 (mid)
+        L(C.node, y2, "to");
+        if (fitList[1]) { L(C.fit, y2, fitList[1].ab); R(C.equiv, y2, fitList[1].eq.toFixed(3)); }
+        if (ftngsTot > 0) R(C.plt, y2, fmt("length", ftngsTot, 3));
+        R(C.ppf, y2, fmt("pressure", Pe, 1));
+        // row 3
+        L(C.node, y3, res.N[n2].label);
+        R(C.elev, y3, fmt("length", z2, 0));
+        R(C.q, y3, fmt("flow", Qt, 2));
+        L(C.nom, y3, fmt("dia", g.d, 3));
+        R(C.plt, y3, fmt("length", g.Lt, 3));
+        R(C.cf, y3, PfFt.toFixed(4));
+        R(C.ppf, y3, fmt("pressure", Pf, 3));
+        L(C.note, y3, `Vel = ${fmt("vel", vel, 2)}`);
+        // extra fitting rows (3+) rare — fold remaining into note
+        if (fitList.length > 2) L(C.note, y2, fitList.slice(2).map((f) => f.ab).join(" "));
+        yy = y3 + RH + 3;
+        doc.setDrawColor(...LINE); doc.setLineWidth(0.3); doc.line(ML, yy - 8, MR, yy - 8);
+      }
+      // tie-in / junction summary line: accumulated flow, pressure, effective K
+      ensure(RH * 2 + 4);
+      const tie = block.tie;
+      const lastSeg = block.segs[block.segs.length - 1];
+      const tieQ = lastSeg.Qt, tieP = res.P[tie];
+      const isSrc = tie === res.srcId;
+      const kEff = tieP > 0 ? tieQ / Math.sqrt(tieP) : 0;
+      doc.setFont("courier", "normal"); doc.setFontSize(7.4);
+      if (isSrc && (project.supply.hose || 0) > 0) {
+        R(C.q, yy, fmt("flow", project.supply.hose, 2));
+        L(C.note, yy, `Qa = ${fmt("flow", project.supply.hose, 2)}`);
+      }
+      L(C.node, yy + RH, res.N[tie].label);
+      R(C.q, yy + RH, fmt("flow", isSrc ? res.supply.demandQ : tieQ, 2));
+      R(C.ppf, yy + RH, fmt("pressure", tieP, 3));
+      L(C.note, yy + RH, `K Factor = ${(isSrc && res.supply.demandQ > 0 ? res.supply.demandQ / Math.sqrt(Math.max(tieP, 1e-6)) : kEff).toFixed(2)}`);
+      yy += RH * 2 + 4;
+      doc.setDrawColor(...INK); doc.setLineWidth(0.6); doc.line(ML, yy - 6, MR, yy - 6); yy += 6;
+    }
+    footer();
+  }
+
+  /* ---------- 4 · FLOW SUMMARY (supply + node analysis) ---------- */
+  if (res?.ok && !res.noDemand) {
+    let yy = startPage("Flow Summary - NFPA");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...INK);
+    doc.text("SUPPLY ANALYSIS", PW / 2, yy + 4, { align: "center" }); yy += 22;
+    doc.setFontSize(8);
+    const sa = supplyCurvePoints(res, project);
+    const saCols = [["Node at Source", ML], ["Static", ML + 110], ["Residual", ML + 175], ["Flow", ML + 245],
+      ["Available", ML + 320], ["Total Demand", ML + 400], ["Required", ML + 490]];
+    saCols.forEach(([t, x]) => doc.text(t, x, yy));
+    yy += 4; doc.setDrawColor(...INK); doc.setLineWidth(0.8); doc.line(ML, yy, MR, yy); yy += 14;
+    doc.setFont("helvetica", "normal");
+    doc.text(project.supply.type === "pump" ? "PUMP" : "SUPPLY", ML, yy);
+    doc.text(fmt("pressure", sa.staticP), ML + 110, yy);
+    doc.text(fmt("pressure", sa.testRes), ML + 175, yy);
+    doc.text(fmt("flow", sa.testFlow), ML + 245, yy);
+    doc.text(fmt("pressure", res.supply.pAvail), ML + 320, yy);
+    doc.text(fmt("flow", res.supply.demandQ), ML + 400, yy);
+    doc.text(fmt("pressure", res.requiredPs), ML + 490, yy);
+    yy += 30;
+
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10);
+    doc.text("NODE ANALYSIS", PW / 2, yy, { align: "center" }); yy += 20;
+    doc.setFontSize(8);
+    const naCols = [["Node Tag", ML], ["Elevation", ML + 90], ["K Factor", ML + 175],
+      ["Pressure", ML + 260], ["Discharge", ML + 345], ["Notes", ML + 440]];
+    naCols.forEach(([t, x]) => doc.text(t, x, yy));
+    yy += 4; doc.setLineWidth(0.8); doc.line(ML, yy, MR, yy); yy += 12;
+    doc.setFont("helvetica", "normal");
+    for (const id of res.ids) {
+      if (yy > PH - 60) { footer(); yy = startPage("Flow Summary - NFPA"); doc.setFont("helvetica", "bold"); doc.setFontSize(8); naCols.forEach(([t, x]) => doc.text(t, x, yy)); yy += 4; doc.line(ML, yy, MR, yy); yy += 12; doc.setFont("helvetica", "normal"); }
+      const nd = res.N[id];
+      doc.text(nd.label, ML, yy);
+      doc.text(fmt("length", nd.z, 1), ML + 90, yy);
+      doc.text(nd.type === "sprinkler" ? fmt("kfac", nd.k) : "", ML + 175, yy);
+      doc.text(fmt("pressure", res.P[id], 2), ML + 260, yy);
+      doc.text(res.spr[id] > 0 ? fmt("flow", res.spr[id], 2) : "", ML + 345, yy);
+      doc.text(nd.type === "sprinkler" && nd.active ? "flowing" : nd.type, ML + 440, yy);
+      yy += 13;
+    }
+    footer();
+  }
+
+  /* ---------- 5 · FITTINGS USED + UNITS SUMMARY ---------- */
+  {
+    let yy = startPage("Fittings Used Summary");
+    // which fitting types are actually used?
+    const used = new Set();
+    (project.pipes || []).forEach((p) => { for (const k in FITTINGS) if ((p.fittings?.[k] || 0) > 0) used.add(k); });
+    const usedKeys = Object.keys(FITTINGS).filter((k) => used.has(k));
+    doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...INK);
+    doc.text("Fitting Legend", ML, yy); yy += 12;
+    doc.setFontSize(7.5);
+    doc.text("Abbrev.", ML, yy); doc.text("Name", ML + 44, yy);
+    const dCols = SCHED40.map((s, i) => ML + 200 + i * 34);
+    SCHED40.forEach((s, i) => doc.text(s.nom.replace(/"/g, ""), dCols[i], yy, { align: "center" }));
+    yy += 4; doc.setLineWidth(0.6); doc.line(ML, yy, MR, yy); yy += 12;
+    doc.setFont("helvetica", "normal");
+    (usedKeys.length ? usedKeys : Object.keys(FITTINGS)).forEach((k) => {
+      doc.text(FIT_ABBR[k], ML, yy);
+      doc.text(`NFPA 13 ${FIT_NAME[k]}`, ML + 44, yy);
+      FITTINGS[k].vals.forEach((v, i) => doc.text(String(v), dCols[i], yy, { align: "center" }));
+      yy += 12;
+    });
+    yy += 18;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.text("Units Summary", ML, yy); yy += 16;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    const units = sys === "us"
+      ? [["Diameter Units", "Inches"], ["Length Units", "Feet"], ["Flow Units", "US Gallons per Minute"], ["Pressure Units", "Pounds per Square Inch"]]
+      : [["Diameter Units", "Millimeters"], ["Length Units", "Meters"], ["Flow Units", "Liters per Minute"], ["Pressure Units", "Bar"]];
+    units.forEach(([k, v]) => { doc.text(k, ML, yy); doc.text(v, ML + 150, yy); yy += 14; });
+    yy += 14;
+    doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+    const note = "Note: Fitting Legend provides equivalent pipe lengths for fitting types of various diameters. Equivalent lengths shown are standard for Sched 40 pipe and C factors of 120; values are adjusted in the calculation for C factors other than 120 per NFPA 13.";
+    doc.text(doc.splitTextToSize(note, MR - ML), ML, yy);
+    footer();
+  }
+
+  const fname = (project.name || "hydraulic-calc").replace(/[^\w\-]+/g, "_") + "_NFPA.pdf";
+  doc.save(fname);
+}
+
+/* ============================================================
    small helpers
    ============================================================ */
 let _uid = 100;
@@ -683,6 +1122,8 @@ function defaultSizer() {
     sLine: 10,               // spacing between branch lines (ft)
     K: 5.6,                  // sprinkler K-factor
     density: 0.20,           // gpm/ft²
+    remoteArea: 1500,        // target design (remote) area within the whole system (ft²)
+    remoteAreaFactor: 1.2,   // NFPA 13 along-branch shape factor (heads/line = factor·√A ÷ spacing)
     elevation: 12,           // system height above supply (ft)
     feedLength: 20,          // riser / feed-main run to the first cross-main (ft)
     branch: { schedule: "sched40", sizeIdx: 1, C: 120 }, // 1¼"
@@ -727,8 +1168,28 @@ function autoSize(project, { vLimit = 32, marginTarget = 0 } = {}) {
   return pipes;
 }
 
+/* Remote (design) area geometry from the spec. The number of sprinklers along
+   each branch line in the operating area is factor·√A ÷ branch spacing (NFPA 13,
+   default factor 1.2), rounded up to whole heads; the number of contributing
+   branch lines follows from the remaining area. Both are clamped to the system
+   the user laid out. Returns the actual rectangle that gets flagged "flowing". */
+function remoteAreaDims(spec) {
+  const lines = Math.max(1, spec.lines | 0), heads = Math.max(1, spec.heads | 0);
+  const sB = Math.max(spec.sBranch, 1), sL = Math.max(spec.sLine, 1);
+  const cov = sB * sL;
+  const factor = spec.remoteAreaFactor || 1.2;
+  const A = Math.max(spec.remoteArea || cov, cov);
+  const headsRemote = Math.min(heads, Math.max(1, Math.ceil((factor * Math.sqrt(A)) / sB)));
+  const linesRemote = Math.min(lines, Math.max(1, Math.ceil((A / cov) / headsRemote)));
+  const actualArea = headsRemote * linesRemote * cov;
+  const branchLen = factor * Math.sqrt(A);          // 1.2√A length along branch lines
+  return { headsRemote, linesRemote, actualArea, cov, branchLen, factor, A,
+    firstLine: lines - linesRemote, firstHead: heads - headsRemote };
+}
+
 function generateNetwork(spec) {
   const nodes = [], pipes = [];
+  const ra = remoteAreaDims(spec);
   const mkSeg = (from, to, grp, len, extra = {}) => {
     const s = spec[grp];
     return { ...mkPipe(from, to, s.sizeIdx, round(Math.max(len, 0.1), 2)), schedule: s.schedule, C: s.C, ...extra };
@@ -763,7 +1224,9 @@ function generateNetwork(spec) {
     let prev = cmL[i];
     for (let j = 0; j < heads; j++) {
       const id = uid("n");
-      nodes.push({ id, label: `${String.fromCharCode(65 + (i % 26))}${j + 1}`, type: "sprinkler", elevation: z, k: spec.K, active: true, x: (j + 1) * sB, y: i * sL });
+      // only the most-remote rectangle (far branch lines × tip heads) flows
+      const inRemote = i >= ra.firstLine && j >= ra.firstHead;
+      nodes.push({ id, label: `${String.fromCharCode(65 + (i % 26))}${j + 1}`, type: "sprinkler", elevation: z, k: spec.K, active: inRemote, x: (j + 1) * sB, y: i * sL });
       pipes.push(mkSeg(prev, id, "branch", spec.sBranch, j === 0 ? { fittings: { ...teeIn } } : {}));
       prev = id;
     }
@@ -780,7 +1243,7 @@ function sampleProject() {
   const S = "S", CM = "CM", A1 = "A1", A2 = "A2", A3 = "A3", B1 = "B1", B2 = "B2", B3 = "B3";
   return {
     name: "Sample — twin branch lines", projectNumber: "DGA-2025-001",
-    client: "Sample Client LLC", location: "—", preparedBy: "", peNumber: "",
+    client: "Sample Client LLC", location: "—", drawingNumber: "FP-101", preparedBy: "", peNumber: "",
     company: "DGA Consulting", reportDate: today(), systemDesc: "Wet-pipe sprinkler system, ordinary hazard.",
     units: "us", systemType: "CMDA",
     design: { mode: "density", hazard: "OH2", density: 0.20, coverageArea: 130, designArea: 1500,
@@ -965,6 +1428,7 @@ function ProjectPanel({ project, update }) {
             <TextField label="Project name" value={project.name} onChange={(v) => set({ name: v })} />
             <TextField label="Project number" value={project.projectNumber} onChange={(v) => set({ projectNumber: v })} />
             <TextField label="Client" value={project.client} onChange={(v) => set({ client: v })} />
+            <TextField label="Drawing no." value={project.drawingNumber} onChange={(v) => set({ drawingNumber: v })} />
             <TextField label="Location / address" value={project.location} onChange={(v) => set({ location: v })} />
             <TextField label="Report date" value={project.reportDate} onChange={(v) => set({ reportDate: v })} />
             <TextField label="Prepared by" value={project.preparedBy} onChange={(v) => set({ preparedBy: v })} />
@@ -1247,14 +1711,14 @@ function SizerPanel({ project, update, res }) {
   const cov = Math.max(spec.sBranch * spec.sLine, 1);             // area per head ≈ S × L
   const minQ = spec.density * cov;
   const minP = Math.pow(minQ / (spec.K || 5.6), 2);
-  const designArea = spec.lines * spec.heads * cov;
-  const remoteLen = 1.2 * Math.sqrt(designArea);                  // NFPA 13 remote-area length
-  const recHeadsPerLine = Math.max(1, Math.ceil(remoteLen / Math.max(spec.sBranch, 1)));
+  const systemArea = spec.lines * spec.heads * cov;               // the whole laid-out system
+  const ra = remoteAreaDims(spec);                                // the operating (remote) rectangle
+  const remoteLen = ra.branchLen;                                 // factor·√A length along branch lines
 
   const generate = () => {
     const { nodes, pipes } = generateNetwork(spec);
     const design = { ...project.design, mode: "density", hazard: "CUS", density: spec.density,
-      coverageArea: round(cov, 2), designArea: round(designArea, 2) };
+      coverageArea: round(cov, 2), designArea: round(ra.actualArea, 2) };
     if (spec.autoSizeOnGen) {
       setSizing(true);
       const next = { ...project, nodes, pipes, systemType: "CMDA", design };
@@ -1333,16 +1797,33 @@ function SizerPanel({ project, update, res }) {
             </div>
           </div>
 
+          {/* remote (design) area — the operating rectangle inside the whole system */}
+          <div className="eyebrow" style={{ margin: "18px 0 8px" }}>Remote (design) area</div>
+          <div className="grid3" style={{ maxWidth: 560 }}>
+            <div className="field"><label>Design area ({lab(sys, "area")})</label>
+              <NumField q="area" value={spec.remoteArea} onChange={(v) => setS({ remoteArea: v })} /></div>
+            <div className="field"><label>Remote area factor</label>
+              <select value={spec.remoteAreaFactor} onChange={(e) => setS({ remoteAreaFactor: parseFloat(e.target.value) })}>
+                <option value={1.0}>1.0 — square area</option>
+                <option value={1.2}>1.2 — NFPA 13 default (1.2√A)</option>
+                <option value={1.4}>1.4 — elongated / extra-stretched</option>
+              </select></div>
+            <div className="field"><label>Remote rectangle</label>
+              <div className="cellinput" style={{ display: "flex", alignItems: "center", height: 38 }}>{ra.linesRemote} lines × {ra.headsRemote} heads</div></div>
+          </div>
+
           {/* derived design basis */}
           <div className="derived">
             <div className="d"><span className="v">{num(toDisp(sys, "area", cov), UPREC[sys].area)}</span><span className="l">area / head ({lab(sys, "area")})</span></div>
             <div className="d"><span className="v">{num(toDisp(sys, "flow", minQ), UPREC[sys].flow)}</span><span className="l">min flow / head ({lab(sys, "flow")})</span></div>
             <div className="d"><span className="v">{num(toDisp(sys, "pressure", minP), UPREC[sys].pressure)}</span><span className="l">remote pressure ({lab(sys, "pressure")})</span></div>
-            <div className="d"><span className="v">{num(toDisp(sys, "area", designArea), UPREC[sys].area)}</span><span className="l">design area ({lab(sys, "area")})</span></div>
-            <div className="d"><span className="v">{recHeadsPerLine}</span><span className="l">heads/line per 1.2√A</span></div>
+            <div className="d"><span className="v">{num(toDisp(sys, "area", systemArea), UPREC[sys].area)}</span><span className="l">whole system ({lab(sys, "area")})</span></div>
+            <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "area", ra.actualArea), UPREC[sys].area)}</span><span className="l">remote area ({lab(sys, "area")})</span></div>
+            <div className="d"><span className="v">{num(toDisp(sys, "length", remoteLen), UPREC[sys].length)}</span><span className="l">{spec.remoteAreaFactor}√A length ({lab(sys, "length")})</span></div>
+            <div className="d"><span className="v">{ra.linesRemote * ra.headsRemote}</span><span className="l">flowing heads</span></div>
           </div>
           <div className="note" style={{ marginTop: 10 }}><Settings2 size={14} style={{ flex: "none", marginTop: 1 }} />
-            <span>Generating replaces the current nodes &amp; pipes and sets the design basis to density/area. The 1.2√A rule suggests {recHeadsPerLine} heads on each branch line in the remote area — you have {spec.heads}. <b>Auto-size</b> then assigns a size to every segment individually (branch lines step down toward the tip, mains grow toward the supply) to hold velocity under the limit and keep the supply margin positive. Fine-tune anything afterward in the Network tab.</span></div>
+            <span>The whole {spec.lines}×{spec.heads} system is drawn, and the most-remote <b>{ra.linesRemote} lines × {ra.headsRemote} heads</b> ({num(toDisp(sys, "area", ra.actualArea), UPREC[sys].area)} {lab(sys, "area")}) are flagged as flowing — the operating area. {spec.remoteAreaFactor}√A puts {ra.headsRemote} heads on each branch line in that area. Generating replaces the current nodes &amp; pipes and sets the design basis to density/area. <b>Auto-size</b> then sizes every segment to hold velocity under the limit and keep the supply margin positive. Fine-tune anything afterward in the Network or Plan tabs.</span></div>
         </div>
         <div className="addbar">
           <button className="btn primary" onClick={generate}><Wrench size={14} /> Generate &amp; calculate</button>
@@ -1398,6 +1879,15 @@ function PlanDrawing({ res, project, update }) {
   const W = spanX * sc + 2 * PAD, H = spanY * sc + 2 * PAD;
   const X = (x) => PAD + (x - minX) * sc, Y = (y) => PAD + (y - minY) * sc;
 
+  // remote (operating) area = bounding box of the flowing sprinklers
+  const activeIds = ids.filter((id) => N[id].type === "sprinkler" && N[id].active);
+  let rmin = null;
+  if (activeIds.length) {
+    let aMinX = Infinity, aMinY = Infinity, aMaxX = -Infinity, aMaxY = -Infinity;
+    activeIds.forEach((id) => { const p = pos[id]; aMinX = Math.min(aMinX, p.x); aMinY = Math.min(aMinY, p.y); aMaxX = Math.max(aMaxX, p.x); aMaxY = Math.max(aMaxY, p.y); });
+    rmin = { x: X(aMinX) - 16, y: Y(aMinY) - 16, w: (aMaxX - aMinX) * sc + 32, h: (aMaxY - aMinY) * sc + 32, count: activeIds.length };
+  }
+
   const selPipe = sel ? pipeById[sel] : null;
   const selEdge = sel ? edges.find((e) => e.id === sel) : null;
   const selAnchor = selEdge ? labelAnchor(orthPath(pos[selEdge.a], pos[selEdge.b])) : null;
@@ -1417,6 +1907,16 @@ function PlanDrawing({ res, project, update }) {
                 <path d="M0,-13 L4,-5 L-4,-5 Z" fill="#8A94A6" />
                 <text x="0" y="25" fill="#8A94A6" fontSize="9" textAnchor="middle" fontFamily="var(--mono)">N</text>
               </g>
+              {/* remote (operating) area highlight — the flowing sprinklers */}
+              {rmin && (
+                <g>
+                  <rect x={rmin.x} y={rmin.y} width={rmin.w} height={rmin.h} rx="6"
+                    fill="rgba(255,122,26,.08)" stroke="var(--fire)" strokeWidth="1.4" strokeDasharray="6 4" />
+                  <text x={rmin.x + 6} y={rmin.y - 6} fill="var(--fire)" fontSize="10" fontWeight="700" fontFamily="var(--mono)">
+                    Remote area · {rmin.count} heads
+                  </text>
+                </g>
+              )}
               {edges.map((e) => {
                 const path = orthPath(pos[e.a], pos[e.b]);
                 const pts = path.map((p) => `${X(p.x)},${Y(p.y)}`).join(" ");
@@ -1770,6 +2270,7 @@ export default function App() {
   const [fittingId, setFittingId] = useState(null);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [pdfErr, setPdfErr] = useState("");
+  const [pdfStyle, setPdfStyle] = useState("nfpa");   // nfpa (HydraCALC worksheet) | report (branded)
 
   const sys = project.units || "us";
   const update = (patch) => setProject((p) => ({ ...p, ...patch }));
@@ -1779,7 +2280,7 @@ export default function App() {
 
   const doExport = async () => {
     setPdfBusy(true); setPdfErr("");
-    try { await exportPDF(project, res, sys); }
+    try { await (pdfStyle === "nfpa" ? exportHydraCalcPDF(project, res, sys) : exportPDF(project, res, sys)); }
     catch (e) { setPdfErr("PDF export needs to load its library from the network. If you're offline or it's blocked, try again on a connection."); }
     finally { setPdfBusy(false); }
   };
@@ -1809,6 +2310,11 @@ export default function App() {
           <button className="btn" onClick={() => setProject(sampleProject())}><FilePlus2 size={14} /> Sample</button>
           <button className="btn" onClick={() => setProject(blankProject())}><FilePlus2 size={14} /> New</button>
           <SaveLoad project={project} setProject={setProject} />
+          <select className="pname" style={{ minWidth: 0, padding: "7px 8px", fontSize: 12 }} value={pdfStyle}
+            onChange={(e) => setPdfStyle(e.target.value)} aria-label="PDF style" title="PDF output style">
+            <option value="nfpa">NFPA worksheet</option>
+            <option value="report">Branded report</option>
+          </select>
           <button className="btn primary" onClick={doExport} disabled={pdfBusy}>{pdfBusy ? <Loader2 size={14} className="spin" /> : <FileText size={14} />} Export PDF</button>
         </div>
 
