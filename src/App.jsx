@@ -348,6 +348,51 @@ function layout(res) {
   return { depth, y, maxDepth, maxY, treeEdge };
 }
 
+/* ---------- Plan (shop-drawing) layout ----------
+   Top-down "as-built" coordinates. When the network carries real plan
+   coordinates (x/y in feet — Sizer-generated), use them directly. Otherwise
+   derive an orthogonal grid from the BFS schematic so any hand-built network
+   still renders with right-angle routing. */
+function planLayout(res, nodes) {
+  if (!res?.ids?.length) return null;
+  const { ids } = res;
+  const byId = Object.fromEntries((nodes || []).map((n) => [n.id, n]));
+  const hasCoords = ids.every((id) => {
+    const n = byId[id];
+    return n && Number.isFinite(n.x) && Number.isFinite(n.y);
+  });
+  const pos = {};
+  if (hasCoords) {
+    ids.forEach((id) => { const n = byId[id]; pos[id] = { x: n.x, y: n.y }; });
+  } else {
+    const lay = layout(res);
+    if (!lay) return null;
+    const COL = 16, ROW = 11; // representative ft spacing for derived grids
+    ids.forEach((id) => { pos[id] = { x: (lay.depth[id] || 0) * COL, y: (lay.y[id] || 0) * ROW }; });
+  }
+  return { pos, isPlan: hasCoords };
+}
+
+/* Manhattan / right-angle route between two points: a straight run when the
+   endpoints share a row or column, otherwise an L (horizontal leg, then
+   vertical) so the drawing only ever shows 90° turns. */
+function orthPath(a, b) {
+  const EPS = 1e-6;
+  if (Math.abs(a.x - b.x) < EPS || Math.abs(a.y - b.y) < EPS) return [a, b];
+  return [a, { x: b.x, y: a.y }, b];
+}
+
+/* Midpoint of a polyline's longest leg — where a dimension/size label reads best. */
+function labelAnchor(path) {
+  let best = null, bestLen = -1;
+  for (let i = 0; i < path.length - 1; i++) {
+    const a = path[i], b = path[i + 1];
+    const len = Math.hypot(b.x - a.x, b.y - a.y);
+    if (len > bestLen) { bestLen = len; best = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, horiz: Math.abs(b.x - a.x) >= Math.abs(b.y - a.y) }; }
+  }
+  return best || { x: path[0].x, y: path[0].y, horiz: true };
+}
+
 /* ============================================================
    PDF EXPORT (jsPDF + autotable, lazy-loaded from cdnjs)
    ============================================================ */
@@ -364,31 +409,48 @@ async function ensurePdfLibs() {
   await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js");
 }
 
-function schematicSVGString(res, sys) {
-  const lay = layout(res); if (!lay) return null;
-  const { ids, srcId, edges, N, P } = res;
-  const colW = 150, rowH = 60, padX = 70, padY = 40;
-  const W = padX * 2 + lay.maxDepth * colW, H = padY * 2 + lay.maxY * rowH;
-  const X = (id) => padX + lay.depth[id] * colW, Y = (id) => padY + lay.y[id] * rowH;
+function schematicSVGString(res, sys, project) {
+  const lay = planLayout(res, project?.nodes); if (!lay) return null;
+  const { ids, edges, N, P } = res;
+  const pos = lay.pos;
+  const pipeById = Object.fromEntries((project?.pipes || []).map((p) => [p.id, p]));
   const flowOf = (e) => {
     const u = res.HGL ? res.HGL[e.a] - res.HGL[e.b] : 0;
     return Math.abs(Math.sign(u) * Math.pow(Math.max(Math.abs(u), 1e-12) / e.g.R, M));
   };
+  // fit the plan bounds (including elbow points) into a sensible page image
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const acc = (p) => { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); };
+  edges.forEach((e) => orthPath(pos[e.a], pos[e.b]).forEach(acc));
+  ids.forEach((id) => acc(pos[id]));
+  if (!isFinite(minX)) return null;
+  const spanX = Math.max(maxX - minX, 1), spanY = Math.max(maxY - minY, 1);
+  const PAD = 46;
+  const sc = Math.max(Math.min(720 / spanX, 420 / spanY, 26), 5);
+  const W = spanX * sc + 2 * PAD, H = spanY * sc + 2 * PAD;
+  const X = (x) => PAD + (x - minX) * sc, Y = (y) => PAD + (y - minY) * sc;
+  const ulab = lab(sys, "length"), tick = ulab === "ft" ? "'" : ` ${ulab}`;
   let s = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"><rect width="${W}" height="${H}" fill="#ffffff"/>`;
   edges.forEach((e) => {
-    const x1 = X(e.a), y1 = Y(e.a), x2 = X(e.b), y2 = Y(e.b);
-    const dash = lay.treeEdge.has(e.id) ? "" : ` stroke-dasharray="5 4"`;
-    s += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#9aa3b0" stroke-width="2.5"${dash}/>`;
-    s += `<text x="${(x1 + x2) / 2}" y="${(y1 + y2) / 2 - 4}" fill="#c2410c" font-size="9" font-family="monospace" text-anchor="middle">${(toDisp(sys, "flow", flowOf(e))).toFixed(UPREC[sys].flow)}</text>`;
+    const path = orthPath(pos[e.a], pos[e.b]);
+    const pts = path.map((p) => `${X(p.x)},${Y(p.y)}`).join(" ");
+    const g = e.g, sw = Math.max(Math.min(g.d * 0.8, 6), 1.6);
+    s += `<polyline points="${pts}" fill="none" stroke="#475569" stroke-width="${sw}" stroke-linejoin="round" stroke-linecap="round"/>`;
+    const pp = pipeById[e.id];
+    const nom = pp ? SCHED40[pp.sizeIdx].nom : `${g.d.toFixed(2)}"`;
+    const len = toDisp(sys, "length", pp ? pp.length : g.Lt).toFixed(UPREC[sys].length);
+    const a = labelAnchor(path), lx = X(a.x), ly = Y(a.y) - 5;
+    s += `<text x="${lx}" y="${ly}" fill="#0f172a" font-size="9" font-family="monospace" text-anchor="middle">${nom} · ${len}${tick}</text>`;
+    if (res.HGL) s += `<text x="${lx}" y="${ly + 10}" fill="#c2410c" font-size="8.5" font-family="monospace" text-anchor="middle">${toDisp(sys, "flow", flowOf(e)).toFixed(UPREC[sys].flow)} ${lab(sys, "flow")}</text>`;
   });
   ids.forEach((id) => {
-    const x = X(id), y = Y(id), nd = N[id];
+    const x = X(pos[id].x), y = Y(pos[id].y), nd = N[id];
     const src = nd.type === "source", spr = nd.type === "sprinkler";
-    const fill = src ? "#ea580c" : spr ? (nd.active ? "#0891b2" : "#e2e8f0") : "#94a3b8";
-    if (src) s += `<rect x="${x - 8}" y="${y - 8}" width="16" height="16" rx="2" fill="${fill}"/>`;
-    else s += `<circle cx="${x}" cy="${y}" r="${spr ? 7 : 4}" fill="${fill}" stroke="#475569"/>`;
-    s += `<text x="${x}" y="${y - 12}" fill="#0f172a" font-size="10" font-weight="bold" text-anchor="middle">${nd.label}</text>`;
-    if (P) s += `<text x="${x}" y="${y + 18}" fill="#475569" font-size="9" font-family="monospace" text-anchor="middle">${toDisp(sys, "pressure", P[id]).toFixed(UPREC[sys].pressure)}</text>`;
+    if (src) s += `<rect x="${x - 7}" y="${y - 7}" width="14" height="14" rx="2" fill="#ea580c"/>`;
+    else if (spr) s += `<circle cx="${x}" cy="${y}" r="6" fill="${nd.active ? "#0891b2" : "#e2e8f0"}" stroke="#475569"/>`;
+    else s += `<rect x="${x - 4}" y="${y - 4}" width="8" height="8" fill="#94a3b8" stroke="#475569"/>`;
+    s += `<text x="${x}" y="${y - 11}" fill="#0f172a" font-size="9" font-weight="bold" text-anchor="middle">${nd.label}</text>`;
+    if (P) s += `<text x="${x}" y="${y + 17}" fill="#475569" font-size="8.5" font-family="monospace" text-anchor="middle">${toDisp(sys, "pressure", P[id]).toFixed(UPREC[sys].pressure)}</text>`;
   });
   s += `</svg>`;
   return { svg: s, W, H };
@@ -526,13 +588,13 @@ async function exportPDF(project, res, sys) {
 
   /* schematic image */
   try {
-    const sv = schematicSVGString(res, sys);
+    const sv = schematicSVGString(res, sys, project);
     if (sv) {
       const png = await svgToPng(sv.svg, sv.W, sv.H);
       if (png) {
         const maxW = PW - 2 * MX, scale = Math.min(maxW / sv.W, 1), w = sv.W * scale, h = sv.H * scale;
         if (yy + h > PH - 60) { doc.addPage(); yy = 60; }
-        sectionHead("Network Schematic");
+        sectionHead("Plan View — Shop Drawing");
         doc.addImage(png, "PNG", MX, yy, w, h); yy += h + 14;
       }
     }
@@ -591,6 +653,19 @@ function mkPipe(from, to, sizeIdx, length) {
     fittings: { e90: 0, e45: 0, tee: 0, gate: 0, bfly: 0, chk: 0 } };
 }
 const today = () => new Date().toISOString().slice(0, 10);
+/* round "nice" axis ticks (1·2·5 steps) spanning 0..max */
+function niceTicks(max, target = 6) {
+  if (!(max > 0)) return [0];
+  const step0 = max / target;
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const n = step0 / mag;
+  const step = (n >= 5 ? 5 : n >= 2 ? 2 : 1) * mag;
+  const out = [];
+  for (let v = 0; v <= max + step * 0.5; v += step) out.push(round(v, 4));
+  return out;
+}
+/* Hazen-Williams flow exponent — water-supply curves are linear on an N^1.85 axis */
+const HW_N = 1.85;
 
 /* ============================================================
    SIZER — parametric network generator (HydraCalc-style)
@@ -659,21 +734,27 @@ function generateNetwork(spec) {
     return { ...mkPipe(from, to, s.sizeIdx, round(Math.max(len, 0.1), 2)), schedule: s.schedule, C: s.C, ...extra };
   };
   const teeIn = { e90: 0, e45: 0, tee: 1, gate: 0, bfly: 0, chk: 0 }; // flow turned 90° into a branch
-  const S = uid("n");
-  nodes.push({ id: S, label: "Supply", type: "source", elevation: 0, k: 0, active: false });
   const z = spec.elevation;
   const lines = Math.max(1, spec.lines | 0), heads = Math.max(1, spec.heads | 0);
+  // plan (top-down, as-built) geometry in feet — the cross-main runs as a
+  // vertical column at x=0, branch lines extend horizontally to the right, and
+  // the feed main enters from the left. These x/y feed the orthogonal plan view.
+  const sB = Math.max(spec.sBranch, 1), sL = Math.max(spec.sLine, 1), feed = Math.max(spec.feedLength, 1);
+
+  const S = uid("n");
+  nodes.push({ id: S, label: "Supply", type: "source", elevation: 0, k: 0, active: false, x: -feed, y: 0 });
 
   // near-side cross-main, one junction per branch line
   const cmL = [];
-  for (let i = 0; i < lines; i++) { const id = uid("n"); cmL.push(id); nodes.push({ id, label: `CM${i + 1}`, type: "junction", elevation: z, k: 0, active: false }); }
+  for (let i = 0; i < lines; i++) { const id = uid("n"); cmL.push(id); nodes.push({ id, label: `CM${i + 1}`, type: "junction", elevation: z, k: 0, active: false, x: 0, y: i * sL }); }
   pipes.push(mkSeg(S, cmL[0], "feed", spec.feedLength));               // riser / feed main
   for (let i = 1; i < lines; i++) pipes.push(mkSeg(cmL[i - 1], cmL[i], "main", spec.sLine));
 
   // far-side cross-main (gridded systems feed each branch line from both ends)
   const cmR = [];
   if (spec.layout === "grid") {
-    for (let i = 0; i < lines; i++) { const id = uid("n"); cmR.push(id); nodes.push({ id, label: `CR${i + 1}`, type: "junction", elevation: z, k: 0, active: false }); }
+    const xR = (heads + 1) * sB;
+    for (let i = 0; i < lines; i++) { const id = uid("n"); cmR.push(id); nodes.push({ id, label: `CR${i + 1}`, type: "junction", elevation: z, k: 0, active: false, x: xR, y: i * sL }); }
     for (let i = 1; i < lines; i++) pipes.push(mkSeg(cmR[i - 1], cmR[i], "main", spec.sLine));
   }
 
@@ -682,7 +763,7 @@ function generateNetwork(spec) {
     let prev = cmL[i];
     for (let j = 0; j < heads; j++) {
       const id = uid("n");
-      nodes.push({ id, label: `${String.fromCharCode(65 + (i % 26))}${j + 1}`, type: "sprinkler", elevation: z, k: spec.K, active: true });
+      nodes.push({ id, label: `${String.fromCharCode(65 + (i % 26))}${j + 1}`, type: "sprinkler", elevation: z, k: spec.K, active: true, x: (j + 1) * sB, y: i * sL });
       pipes.push(mkSeg(prev, id, "branch", spec.sBranch, j === 0 ? { fittings: { ...teeIn } } : {}));
       prev = id;
     }
@@ -810,6 +891,14 @@ const CSS = `
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 .schem{width:100%;background:#0c1016;border-radius:10px;border:1px solid var(--line)}
+.planscroll{overflow:auto;background:#0c1016;border:1px solid var(--line);border-radius:10px;max-height:620px}
+.planstage{position:relative}
+.planstage .schem{border:none;border-radius:0}
+.pipepop{position:absolute;transform:translateX(-50%);z-index:5;background:var(--panel2);border:1px solid var(--fire);border-radius:10px;padding:10px 11px;width:216px;box-shadow:0 12px 30px rgba(0,0,0,.55)}
+.pipepop .pophead{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;font-weight:700;color:var(--fire);margin-bottom:9px}
+.pipepop .poprow{display:grid;grid-template-columns:70px 1fr;align-items:center;gap:8px;margin-bottom:7px}
+.pipepop .poprow label{font-size:10.5px;color:var(--mut);font-weight:600}
+.pipepop .popnote{font-size:10px;color:var(--mut);margin-top:7px;font-family:var(--mono);line-height:1.4}
 .chartbox{height:330px;width:100%}
 .ai-resp{background:#0f141c;border:1px solid var(--line);border-radius:10px;padding:14px 16px;font-size:13.5px;line-height:1.6;white-space:pre-wrap;min-height:80px}
 .ai-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
@@ -1285,40 +1374,108 @@ function SizerPanel({ project, update, res }) {
   );
 }
 
-function Schematic({ res }) {
+/* ---- Plan view: top-down as-built shop drawing, editable on the drawing ---- */
+function PlanDrawing({ res, project, update }) {
   const { sys } = useUnits();
-  const lay = useMemo(() => layout(res), [res]);
+  const [sel, setSel] = useState(null);                       // selected pipe id
+  const lay = useMemo(() => planLayout(res, project.nodes), [res, project.nodes]);
   if (!res?.ok || !lay) return null;
-  const { ids, srcId, edges, N, P } = res;
-  const colW = 150, rowH = 64, padX = 70, padY = 44;
-  const W = padX * 2 + lay.maxDepth * colW, H = padY * 2 + lay.maxY * rowH;
-  const X = (id) => padX + lay.depth[id] * colW, Y = (id) => padY + lay.y[id] * rowH;
+  const { ids, edges, N, P } = res;
+  const pos = lay.pos;
+  const pipeById = Object.fromEntries((project.pipes || []).map((p) => [p.id, p]));
+  const setPipe = (id, patch) => update({ pipes: project.pipes.map((p) => (p.id === id ? { ...p, ...patch } : p)) });
   const flowOf = (e) => { const u = res.HGL ? res.HGL[e.a] - res.HGL[e.b] : 0; return Math.abs(Math.sign(u) * Math.pow(Math.max(Math.abs(u), 1e-12) / e.g.R, M)); };
+
+  // fit plan bounds (incl. elbow points) into pixels at a uniform scale
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const acc = (p) => { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); };
+  edges.forEach((e) => orthPath(pos[e.a], pos[e.b]).forEach(acc));
+  ids.forEach((id) => acc(pos[id]));
+  if (!isFinite(minX)) return null;
+  const spanX = Math.max(maxX - minX, 1), spanY = Math.max(maxY - minY, 1);
+  const PAD = 58;
+  const sc = Math.max(Math.min(820 / spanX, 560 / spanY, 30), 6); // px per ft
+  const W = spanX * sc + 2 * PAD, H = spanY * sc + 2 * PAD;
+  const X = (x) => PAD + (x - minX) * sc, Y = (y) => PAD + (y - minY) * sc;
+
+  const selPipe = sel ? pipeById[sel] : null;
+  const selEdge = sel ? edges.find((e) => e.id === sel) : null;
+  const selAnchor = selEdge ? labelAnchor(orthPath(pos[selEdge.a], pos[selEdge.b])) : null;
+
   return (
     <div className="card">
-      <div className="head"><Waves size={15} color="var(--water)" /><h3>Network schematic</h3>
-        <span className="desc">{res.looped ? "Gridded — dashed edges close loops" : "Pressures shown at each node"}</span></div>
-      <div className="body" style={{ overflowX: "auto" }}>
-        <svg className="schem" viewBox={`0 0 ${W} ${H}`} width="100%" style={{ minWidth: Math.min(W, 900), height: Math.max(220, H + 10) }}>
-          {edges.map((e) => {
-            const x1 = X(e.a), y1 = Y(e.a), x2 = X(e.b), y2 = Y(e.b), loop = !lay.treeEdge.has(e.id);
-            return <g key={e.id}>
-              <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={loop ? "#5C6678" : "#33414f"} strokeWidth="3" strokeDasharray={loop ? "6 5" : ""} />
-              {res.HGL && <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 5} fill="var(--fire)" fontSize="10" fontFamily="var(--mono)" textAnchor="middle">{num(toDisp(sys, "flow", flowOf(e)), UPREC[sys].flow)}</text>}
-            </g>;
-          })}
-          {ids.map((id) => {
-            const nd = N[id], x = X(id), y = Y(id), src = nd.type === "source", spr = nd.type === "sprinkler";
-            const fill = src ? "#FF7A1A" : spr ? (nd.active ? "#2BD4D9" : "#1B2230") : "#39424f";
-            const stroke = src ? "#ffb066" : spr ? "#2BD4D9" : "#5C6678";
-            return <g key={id}>
-              {src ? <rect x={x - 9} y={y - 9} width="18" height="18" rx="3" fill={fill} stroke={stroke} strokeWidth="1.5" />
-                : <circle cx={x} cy={y} r={spr ? 8 : 5} fill={fill} stroke={stroke} strokeWidth="1.5" />}
-              <text x={x} y={y - 14} fill="var(--txt)" fontSize="11" fontWeight="600" textAnchor="middle">{nd.label}</text>
-              {P && <text x={x} y={y + 22} fill="var(--mut)" fontSize="10" fontFamily="var(--mono)" textAnchor="middle">{num(toDisp(sys, "pressure", P[id]), UPREC[sys].pressure)}</text>}
-            </g>;
-          })}
-        </svg>
+      <div className="head"><Waves size={15} color="var(--water)" /><h3>Plan view — shop drawing</h3>
+        <span className="desc">Top-down · click a pipe to size it on the drawing</span></div>
+      <div className="body">
+        <div className="planscroll">
+          <div className="planstage" style={{ width: W, height: H }}>
+            <svg className="schem" viewBox={`0 0 ${W} ${H}`} width={W} height={H} style={{ display: "block" }}
+              onClick={() => setSel(null)}>
+              {/* north arrow — orient the as-built */}
+              <g transform={`translate(${W - 28},30)`}>
+                <line x1="0" y1="13" x2="0" y2="-9" stroke="#5C6678" strokeWidth="1.5" />
+                <path d="M0,-13 L4,-5 L-4,-5 Z" fill="#8A94A6" />
+                <text x="0" y="25" fill="#8A94A6" fontSize="9" textAnchor="middle" fontFamily="var(--mono)">N</text>
+              </g>
+              {edges.map((e) => {
+                const path = orthPath(pos[e.a], pos[e.b]);
+                const pts = path.map((p) => `${X(p.x)},${Y(p.y)}`).join(" ");
+                const g = e.g, sw = Math.max(Math.min(g.d * 0.9, 9), 2), on = sel === e.id;
+                const a = labelAnchor(path), lx = X(a.x), ly = Y(a.y);
+                const pp = pipeById[e.id];
+                const nom = pp ? SCHED40[pp.sizeIdx].nom : `${g.d.toFixed(2)}"`;
+                const len = pp ? num(toDisp(sys, "length", pp.length), UPREC[sys].length) : "—";
+                const flow = res.HGL ? num(toDisp(sys, "flow", flowOf(e)), UPREC[sys].flow) : null;
+                const lab1 = `${nom} · ${len} ${lab(sys, "length")}`;
+                const bw = lab1.length * 6.3 + 12;
+                return (
+                  <g key={e.id} style={{ cursor: "pointer" }} onClick={(ev) => { ev.stopPropagation(); setSel(on ? null : e.id); }}>
+                    <polyline points={pts} fill="none" stroke="transparent" strokeWidth={Math.max(sw + 12, 16)} />
+                    <polyline points={pts} fill="none" stroke={on ? "var(--fire)" : "#5C6678"} strokeWidth={sw} strokeLinejoin="round" strokeLinecap="round" />
+                    <g transform={`translate(${lx},${ly})`}>
+                      <rect x={-bw / 2} y={-22} width={bw} height={flow != null ? 30 : 17} rx="3" fill="#0c1016" stroke={on ? "var(--fire)" : "#2A323F"} />
+                      <text x="0" y={-11} fill={on ? "var(--fire)" : "var(--txt)"} fontSize="10" fontFamily="var(--mono)" textAnchor="middle">{lab1}</text>
+                      {flow != null && <text x="0" y={1} fill="var(--fire)" fontSize="9.5" fontFamily="var(--mono)" textAnchor="middle">{flow} {lab(sys, "flow")}</text>}
+                    </g>
+                  </g>
+                );
+              })}
+              {ids.map((id) => {
+                const x = X(pos[id].x), y = Y(pos[id].y), nd = N[id];
+                const src = nd.type === "source", spr = nd.type === "sprinkler";
+                return (
+                  <g key={id}>
+                    {src ? <rect x={x - 8} y={y - 8} width="16" height="16" rx="2" fill="#FF7A1A" stroke="#ffb066" strokeWidth="1.5" />
+                      : spr ? <circle cx={x} cy={y} r="7" fill={nd.active ? "#2BD4D9" : "#1B2230"} stroke="#2BD4D9" strokeWidth="1.5" />
+                      : <rect x={x - 5} y={y - 5} width="10" height="10" fill="#39424f" stroke="#5C6678" strokeWidth="1.5" />}
+                    <text x={x} y={y - 13} fill="var(--txt)" fontSize="10.5" fontWeight="600" textAnchor="middle">{nd.label}</text>
+                    {P && <text x={x} y={y + 19} fill="var(--mut)" fontSize="9.5" fontFamily="var(--mono)" textAnchor="middle">{num(toDisp(sys, "pressure", P[id]), UPREC[sys].pressure)}</text>}
+                  </g>
+                );
+              })}
+            </svg>
+            {selPipe && selAnchor && (
+              <div className="pipepop" style={{ left: X(selAnchor.x), top: Y(selAnchor.y) + 14 }} onClick={(e) => e.stopPropagation()}>
+                <div className="pophead"><span>{`${N[selEdge.a].label} → ${N[selEdge.b].label}`}</span>
+                  <button className="iconbtn" onClick={() => setSel(null)} aria-label="Close" style={{ padding: 3 }}><X size={12} /></button></div>
+                <div className="poprow"><label>Size</label>
+                  <select className="cellsel" value={selPipe.sizeIdx} onChange={(e) => setPipe(sel, { sizeIdx: +e.target.value })}>
+                    {SCHED40.map((s, i) => <option key={i} value={i}>{s.nom}</option>)}</select></div>
+                <div className="poprow"><label>Sched</label>
+                  <select className="cellsel" value={selPipe.schedule || "sched40"} onChange={(e) => setPipe(sel, { schedule: e.target.value })}>
+                    {Object.entries(SCHED).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}</select></div>
+                <div className="poprow"><label>Material</label>
+                  <select className="cellsel" value={selPipe.C} onChange={(e) => setPipe(sel, { C: +e.target.value })}>
+                    {MATERIALS.map((m, i) => <option key={i} value={m.c}>{m.label} · {m.c}</option>)}</select></div>
+                <div className="poprow"><label>Length ({lab(sys, "length")})</label>
+                  <NumField className="cellinput" q="length" value={selPipe.length} onChange={(v) => setPipe(sel, { length: v })} /></div>
+                <div className="popnote">Ø {num(toDisp(sys, "dia", selEdge.g.d), UPREC[sys].dia)} {lab(sys, "dia")} · eq. len {num(toDisp(sys, "length", selEdge.g.Lt), UPREC[sys].length)} {lab(sys, "length")}</div>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="note" style={{ marginTop: 10 }}><Settings2 size={14} style={{ flex: "none", marginTop: 1 }} />
+          <span>Top-down as-built view with 90° pipe routing. Click any pipe to edit its diameter, schedule, material, and length right on the drawing — edits feed straight into the calculation.</span></div>
       </div>
     </div>
   );
@@ -1330,13 +1487,23 @@ function SupplyPanel({ project, update, res }) {
   const s = project.supply;
   const setS = (patch) => update({ supply: { ...s, ...patch } });
   const setP = (patch) => update({ supply: { ...s, pump: { ...s.pump, ...patch } } });
-  const chartData = useMemo(() => {
-    if (!res?.ok || res.noDemand) return [];
+  // Water-supply graph on the fire-protection N^1.85 scale: the flow axis is
+  // plotted to the 1.85 power so the Hazen-Williams supply curve
+  // (P = static − k·Q^1.85) renders as a straight line, as on N1.85 graph paper.
+  const chart = useMemo(() => {
+    if (!res?.ok || res.noDemand) return { data: [], ticks: [0], maxQx: 1 };
     const maxQ = Math.max((s.type === "pump" ? s.pump.suctionTestFlow : s.testFlow) * 1.1, res.supply.demandQ * 1.4, 100);
-    const a = res.supply.availAt; const pts = [];
-    for (let i = 0; i <= 40; i++) { const q = (maxQ / 40) * i; pts.push({ q: round(toDisp(sys, "flow", q), 0), p: round(toDisp(sys, "pressure", a(q)), UPREC[sys].pressure) }); }
-    return pts;
+    const a = res.supply.availAt, pts = [];
+    for (let i = 0; i <= 40; i++) {
+      const q = (maxQ / 40) * i, qd = round(toDisp(sys, "flow", q), 0);
+      pts.push({ q: qd, qx: Math.pow(qd, HW_N), p: round(toDisp(sys, "pressure", a(q)), UPREC[sys].pressure) });
+    }
+    const maxQd = toDisp(sys, "flow", maxQ);
+    const ticks = niceTicks(maxQd).map((v) => round(Math.pow(v, HW_N), 4));
+    return { data: pts, ticks, maxQx: Math.pow(maxQd, HW_N) };
   }, [res, s, sys]);
+  const chartData = chart.data;
+  const qxFmt = (v) => num(Math.pow(Math.max(v, 0), 1 / HW_N), 0);
 
   return (
     <>
@@ -1391,19 +1558,22 @@ function SupplyPanel({ project, update, res }) {
       {res?.ok && !res.noDemand && (
         <div className="card">
           <div className="head"><BarChart3 size={15} color="var(--fire)" /><h3>Demand vs. supply</h3>
-            <span className="desc">Operating point must sit under the curve</span></div>
+            <span className="desc">N¹·⁸⁵ scale — supply plots as a straight line</span></div>
           <div className="body"><div className="chartbox">
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={chartData} margin={{ top: 10, right: 20, bottom: 28, left: 6 }}>
                 <CartesianGrid stroke="#222b38" />
-                <XAxis dataKey="q" stroke="#5C6678" tick={{ fontSize: 11, fill: "#8A94A6" }}
-                  label={{ value: `Flow (${lab(sys, "flow")})`, position: "bottom", offset: 6, fill: "#8A94A6", fontSize: 12 }} />
+                <XAxis dataKey="qx" type="number" scale="linear" domain={[0, chart.maxQx]} ticks={chart.ticks} tickFormatter={qxFmt}
+                  stroke="#5C6678" tick={{ fontSize: 11, fill: "#8A94A6" }} allowDataOverflow
+                  label={{ value: `Flow (${lab(sys, "flow")}) — N¹·⁸⁵ scale`, position: "bottom", offset: 6, fill: "#8A94A6", fontSize: 12 }} />
                 <YAxis stroke="#5C6678" tick={{ fontSize: 11, fill: "#8A94A6" }}
                   label={{ value: `Pressure (${lab(sys, "pressure")})`, angle: -90, position: "insideLeft", fill: "#8A94A6", fontSize: 12 }} />
-                <Tooltip contentStyle={{ background: "#141922", border: "1px solid #2A323F", borderRadius: 8, fontSize: 12 }} labelStyle={{ color: "#E6EAF0" }} />
+                <Tooltip contentStyle={{ background: "#141922", border: "1px solid #2A323F", borderRadius: 8, fontSize: 12 }} labelStyle={{ color: "#E6EAF0" }}
+                  labelFormatter={(v) => `${qxFmt(v)} ${lab(sys, "flow")}`}
+                  formatter={(val) => [`${val} ${lab(sys, "pressure")}`, "Available supply"]} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Line type="monotone" dataKey="p" name="Available supply" stroke="#2BD4D9" strokeWidth={2.5} dot={false} />
-                <ReferenceDot x={round(toDisp(sys, "flow", res.supply.demandQ), 0)} y={round(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure)}
+                <Line type="linear" dataKey="p" name="Available supply" stroke="#2BD4D9" strokeWidth={2.5} dot={false} />
+                <ReferenceDot x={round(Math.pow(toDisp(sys, "flow", res.supply.demandQ), HW_N), 4)} y={round(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure)}
                   r={6} fill="#FF7A1A" stroke="#FFB066" strokeWidth={2} label={{ value: "Demand", position: "top", fill: "#FF7A1A", fontSize: 11 }} />
               </ComposedChart>
             </ResponsiveContainer>
@@ -1668,13 +1838,13 @@ export default function App() {
           {tab === "project" && <ProjectPanel project={project} update={update} />}
           {tab === "sizer" && <>
             <SizerPanel project={project} update={update} res={res} />
-            <Schematic res={res} />
+            <PlanDrawing res={res} project={project} update={update} />
           </>}
           {tab === "network" && <>
             <DesignBasisPanel project={project} update={update} res={res} />
             <NodesEditor project={project} update={update} />
             <PipesEditor project={project} update={update} openFittings={(id) => setFittingId(id)} />
-            <Schematic res={res} />
+            <PlanDrawing res={res} project={project} update={update} />
           </>}
           {tab === "supply" && <SupplyPanel project={project} update={update} res={res} />}
           {tab === "results" && <ResultsPanel res={res} />}
