@@ -61,6 +61,14 @@ const SCHED40 = [
   { nom: '4"', id: 4.026 }, { nom: '5"', id: 5.047 }, { nom: '6"', id: 6.065 },
   { nom: '8"', id: 7.981 },
 ];
+// Internal diameters (in) for additional steel pipe schedules, indexed 1:1 with the
+// nominal sizes in SCHED40 above. Because the NFPA 13 fitting equivalent-length table
+// (FITTINGS) is keyed to nominal size, those equivalents apply across all steel schedules.
+const SCHED = {
+  sched40: { label: "Sched 40", id: SCHED40.map((s) => s.id) },
+  sched10: { label: "Sched 10", id: [1.097, 1.442, 1.682, 2.157, 2.635, 3.260, 4.260, 5.295, 6.357, 8.249] },
+  sched80: { label: "Sched 80", id: [0.957, 1.278, 1.500, 1.939, 2.323, 2.900, 3.826, 4.813, 5.761, 7.625] },
+};
 const MATERIALS = [
   { label: "Black / galv. steel", c: 120 },
   { label: "Cement-lined ductile", c: 140 },
@@ -117,7 +125,8 @@ const velocity = (Q, d) => 0.4085 * Q / (d * d);
 const fittingFactor = (C) => Math.pow(C / 120, 1.85);
 
 function pipeGeom(pipe) {
-  const d = pipe.customId > 0 ? pipe.customId : SCHED40[pipe.sizeIdx].id;
+  const sch = SCHED[pipe.schedule] || SCHED.sched40;
+  const d = pipe.customId > 0 ? pipe.customId : sch.id[pipe.sizeIdx];
   let raw = 0;
   for (const key in FITTINGS) raw += (pipe.fittings?.[key] || 0) * FITTINGS[key].vals[pipe.sizeIdx];
   const adj = raw * fittingFactor(pipe.C);
@@ -125,17 +134,30 @@ function pipeGeom(pipe) {
   return { d, C: pipe.C, Lt, rawEquiv: raw, adjEquiv: adj, R: hwR(pipe.C, d, Lt) };
 }
 
-/* General nodal Newton-Raphson solver — trees AND gridded loops */
-function solveNetwork(ctx, Ps, warm) {
+/* General nodal Newton-Raphson solver — trees AND gridded loops.
+   opts.velocityPressure: when true, sprinkler discharge uses normal pressure
+   Pn = Pt − Pv, with Pv = 0.001123·Q²/d⁴ from the dominant upstream (feeding)
+   pipe (SFPE / NFPA 13). Pv is lagged within each Newton iteration, so the
+   solver re-evaluates it as flows converge — exact on trees, a close
+   approximation on grids. Default off (conservative, NFPA-permitted). */
+function solveNetwork(ctx, Ps, warm, opts = {}) {
   const { ids, N, srcId, inc, unk, idx, n } = ctx;
+  const vp = !!opts.velocityPressure;
   const HGLsrc = Ps + EHEAD * N[srcId].z;
   const HGL = {}; ids.forEach((id) => (HGL[id] = warm?.[id] ?? HGLsrc));
   HGL[srcId] = HGLsrc;
 
   const qf = (R, u) => Math.sign(u) * Math.pow(Math.max(Math.abs(u), 1e-12) / R, M);
+  // velocity pressure from the largest inflowing pipe at this node
+  const pvAt = (id) => {
+    if (!vp) return 0;
+    let qin = 0, dd = 0;
+    for (const e of inc[id]) { const q = qf(e.R, HGL[e.o] - HGL[id]); if (q > qin) { qin = q; dd = e.d; } }
+    return dd > 0 ? 0.001123 * qin * qin / Math.pow(dd, 4) : 0;
+  };
   const dem = (id) => {
     const nd = N[id]; if (!(nd.k > 0 && nd.active)) return 0;
-    return nd.k * Math.sqrt(Math.max(HGL[id] - EHEAD * nd.z, 0));
+    return nd.k * Math.sqrt(Math.max(HGL[id] - EHEAD * nd.z - pvAt(id), 0));
   };
 
   for (let it = 0; it < 80; it++) {
@@ -152,7 +174,7 @@ function solveNetwork(ctx, Ps, warm) {
     const A = Array.from({ length: n }, () => new Array(n + 1).fill(0));
     for (const id of unk) {
       const i = idx[id], nd = N[id];
-      const P = HGL[id] - EHEAD * nd.z;
+      const P = HGL[id] - EHEAD * nd.z - pvAt(id);
       if (nd.k > 0 && nd.active && P > 0) A[i][i] += nd.k / (2 * Math.sqrt(P));
       for (const e of inc[id]) {
         const u = HGL[id] - HGL[e.o], au = Math.max(Math.abs(u), 1e-9);
@@ -184,9 +206,10 @@ function solveNetwork(ctx, Ps, warm) {
   }
 
   const P = {}; ids.forEach((id) => (P[id] = HGL[id] - EHEAD * N[id].z));
+  const Pn = {}; ids.forEach((id) => (Pn[id] = P[id] - pvAt(id))); // normal (discharge) pressure
   const spr = {}; ids.forEach((id) => (spr[id] = dem(id)));
   const totalQ = ids.reduce((s, id) => s + spr[id], 0);
-  return { P, HGL, spr, totalQ };
+  return { P, Pn, HGL, spr, totalQ };
 }
 
 /* density/area → required pressure at remote sprinkler */
@@ -194,7 +217,9 @@ function densityCalc(design, kGov) {
   const minQ = design.density * design.coverageArea;       // gpm per head
   const minP = Math.pow(minQ / (kGov || 5.6), 2);          // psi
   const nHeads = Math.ceil(design.designArea / design.coverageArea);
-  return { minQ, minP, nHeads };
+  // NFPA 13 remote-area length along the branch lines: L = 1.2·√A (rounded up to whole heads by the caller)
+  const remoteLen = 1.2 * Math.sqrt(Math.max(design.designArea, 0));
+  return { minQ, minP, nHeads, remoteLen };
 }
 
 /* pump boost quadratic ΔP(Q) through churn / rated / 150% */
@@ -240,7 +265,7 @@ function analyze(project) {
   for (const p of pipes) {
     if (!N[p.from] || !N[p.to] || p.from === p.to) continue;
     const g = pipeGeom(p); geom[p.id] = g;
-    inc[p.from].push({ o: p.to, R: g.R }); inc[p.to].push({ o: p.from, R: g.R });
+    inc[p.from].push({ o: p.to, R: g.R, d: g.d }); inc[p.to].push({ o: p.from, R: g.R, d: g.d });
     edges.push({ id: p.id, a: p.from, b: p.to, g });
   }
   // connectivity
@@ -256,21 +281,23 @@ function analyze(project) {
   const activeSpr = nodes.filter((n) => n.type === "sprinkler" && n.active && n.k > 0);
   const minP = resolveMinPressure(project, activeSpr);
   const availAt = supplyAvailFn(supply);
+  const opts = { velocityPressure: !!project.design.velocityPressure };
 
   if (activeSpr.length === 0) {
     return { ok: true, noDemand: true, looped, disconnected, ids, N, srcId, edges, geom, minP };
   }
 
-  // design search: source pressure so min active-sprinkler pressure == minP (warm-started)
+  // design search: source pressure so the min active-sprinkler discharge (normal)
+  // pressure == minP (warm-started)
   let lo = minP, hi = minP + 3000, warm = null;
   for (let i = 0; i < 64; i++) {
     const mid = (lo + hi) / 2;
-    const r = solveNetwork(ctx, mid, warm); warm = r.HGL;
-    const m = Math.min(...activeSpr.map((s) => r.P[s.id]));
+    const r = solveNetwork(ctx, mid, warm, opts); warm = r.HGL;
+    const m = Math.min(...activeSpr.map((s) => r.Pn[s.id]));
     if (m < minP) lo = mid; else hi = mid;
   }
   const requiredPs = (lo + hi) / 2;
-  const sol = solveNetwork(ctx, requiredPs, warm);
+  const sol = solveNetwork(ctx, requiredPs, warm, opts);
 
   const totalQ = activeSpr.reduce((a, s) => a + sol.spr[s.id], 0);
   const pipeRows = edges.map((e) => {
@@ -290,7 +317,8 @@ function analyze(project) {
 
   return {
     ok: true, looped, disconnected, ids, N, srcId, edges, geom,
-    P: sol.P, spr: sol.spr, requiredPs, totalQ, pipeRows, activeSpr, minP,
+    P: sol.P, Pn: sol.Pn, spr: sol.spr, requiredPs, totalQ, pipeRows, activeSpr, minP,
+    velocityPressure: opts.velocityPressure,
     supply: { availAt, demandQ, pAvail, margin },
   };
 }
@@ -559,10 +587,77 @@ const uid = (p) => `${p}${_uid++}`;
 const num = (v, d = 1) => (v == null || isNaN(v) ? "—" : Number(v).toFixed(d));
 const round = (v, d) => (v == null || isNaN(v) ? v : +Number(v).toFixed(d));
 function mkPipe(from, to, sizeIdx, length) {
-  return { id: uid("p"), from, to, sizeIdx, customId: 0, C: 120, length,
+  return { id: uid("p"), from, to, sizeIdx, schedule: "sched40", customId: 0, C: 120, length,
     fittings: { e90: 0, e45: 0, tee: 0, gate: 0, bfly: 0, chk: 0 } };
 }
 const today = () => new Date().toISOString().slice(0, 10);
+
+/* ============================================================
+   SIZER — parametric network generator (HydraCalc-style)
+   Turns high-level inputs (layout, grid dimensions, pipe sizes, K, density)
+   into a full node/pipe network the existing solver can analyze.
+   Size selection is centralized in mkSeg, so an auto-size optimizer can
+   later iterate sizeIdx per group to meet the demand/velocity targets.
+   ============================================================ */
+function defaultSizer() {
+  return {
+    layout: "tree",          // tree | grid | loop
+    lines: 5,                // branch lines in the design area
+    heads: 5,                // sprinklers per branch line
+    sBranch: 12,             // spacing along a branch line (ft)
+    sLine: 10,               // spacing between branch lines (ft)
+    K: 5.6,                  // sprinkler K-factor
+    density: 0.20,           // gpm/ft²
+    elevation: 12,           // system height above supply (ft)
+    feedLength: 20,          // riser / feed-main run to the first cross-main (ft)
+    branch: { schedule: "sched40", sizeIdx: 1, C: 120 }, // 1¼"
+    main:   { schedule: "sched40", sizeIdx: 6, C: 120 }, // 4"
+    feed:   { schedule: "sched40", sizeIdx: 8, C: 120 }, // 6"
+  };
+}
+
+function generateNetwork(spec) {
+  const nodes = [], pipes = [];
+  const mkSeg = (from, to, grp, len, extra = {}) => {
+    const s = spec[grp];
+    return { ...mkPipe(from, to, s.sizeIdx, round(Math.max(len, 0.1), 2)), schedule: s.schedule, C: s.C, ...extra };
+  };
+  const teeIn = { e90: 0, e45: 0, tee: 1, gate: 0, bfly: 0, chk: 0 }; // flow turned 90° into a branch
+  const S = uid("n");
+  nodes.push({ id: S, label: "Supply", type: "source", elevation: 0, k: 0, active: false });
+  const z = spec.elevation;
+  const lines = Math.max(1, spec.lines | 0), heads = Math.max(1, spec.heads | 0);
+
+  // near-side cross-main, one junction per branch line
+  const cmL = [];
+  for (let i = 0; i < lines; i++) { const id = uid("n"); cmL.push(id); nodes.push({ id, label: `CM${i + 1}`, type: "junction", elevation: z, k: 0, active: false }); }
+  pipes.push(mkSeg(S, cmL[0], "feed", spec.feedLength));               // riser / feed main
+  for (let i = 1; i < lines; i++) pipes.push(mkSeg(cmL[i - 1], cmL[i], "main", spec.sLine));
+
+  // far-side cross-main (gridded systems feed each branch line from both ends)
+  const cmR = [];
+  if (spec.layout === "grid") {
+    for (let i = 0; i < lines; i++) { const id = uid("n"); cmR.push(id); nodes.push({ id, label: `CR${i + 1}`, type: "junction", elevation: z, k: 0, active: false }); }
+    for (let i = 1; i < lines; i++) pipes.push(mkSeg(cmR[i - 1], cmR[i], "main", spec.sLine));
+  }
+
+  // branch lines with sprinklers
+  for (let i = 0; i < lines; i++) {
+    let prev = cmL[i];
+    for (let j = 0; j < heads; j++) {
+      const id = uid("n");
+      nodes.push({ id, label: `${String.fromCharCode(65 + (i % 26))}${j + 1}`, type: "sprinkler", elevation: z, k: spec.K, active: true });
+      pipes.push(mkSeg(prev, id, "branch", spec.sBranch, j === 0 ? { fittings: { ...teeIn } } : {}));
+      prev = id;
+    }
+    if (spec.layout === "grid") pipes.push(mkSeg(prev, cmR[i], "branch", spec.sBranch)); // close the line loop
+  }
+
+  // looped feed: return main ties the far end of the cross-main back to the source
+  if (spec.layout === "loop") pipes.push(mkSeg(cmL[lines - 1], S, "main", spec.feedLength + spec.sLine * (lines - 1)));
+
+  return { nodes, pipes };
+}
 
 function sampleProject() {
   const S = "S", CM = "CM", A1 = "A1", A2 = "A2", A3 = "A3", B1 = "B1", B2 = "B2", B3 = "B3";
@@ -572,7 +667,8 @@ function sampleProject() {
     company: "DGA Consulting", reportDate: today(), systemDesc: "Wet-pipe sprinkler system, ordinary hazard.",
     units: "us", systemType: "CMDA",
     design: { mode: "density", hazard: "OH2", density: 0.20, coverageArea: 130, designArea: 1500,
-      designSprinklers: 12, listingPressure: 50, minPressure: 7 },
+      designSprinklers: 12, listingPressure: 50, minPressure: 7, velocityPressure: false },
+    sizer: defaultSizer(),
     nodes: [
       { id: S, label: "Supply", type: "source", elevation: 0, k: 0, active: false },
       { id: CM, label: "Cross main", type: "junction", elevation: 10, k: 0, active: false },
@@ -817,6 +913,8 @@ function DesignBasisPanel({ project, update, res }) {
               <div className="d"><span className="v">{num(toDisp(sys, "pressure", dc.minP), UPREC[sys].pressure)}</span>
                 <span className="l">→ remote pressure ({lab(sys, "pressure")})</span></div>
               <div className="d"><span className="v">{dc.nHeads}</span><span className="l">design sprinklers</span></div>
+              <div className="d"><span className="v">{num(toDisp(sys, "length", dc.remoteLen), UPREC[sys].length)}</span>
+                <span className="l">1.2√A length ({lab(sys, "length")})</span></div>
               <div className="d"><span className="v" style={{ color: activeCount === targetCount ? "var(--ok)" : "var(--gold)" }}>{activeCount}</span>
                 <span className="l">currently flowing</span></div>
             </div>
@@ -852,6 +950,18 @@ function DesignBasisPanel({ project, update, res }) {
               <span>{project.systemType} systems are designed by the number of operating sprinklers at the listed minimum pressure. Enter values from the sprinkler's listing.</span></div>
           </>
         )}
+
+        <div className="field" style={{ marginTop: 14 }}>
+          <label>Velocity pressures</label>
+          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+            <Toggle on={!!d.velocityPressure} onChange={(v) => setD({ velocityPressure: v })} />
+            <span style={{ fontSize: 12, color: "var(--mut)" }}>
+              {d.velocityPressure
+                ? "On — discharge uses normal pressure Pₙ = Pₜ − Pᵥ (Pᵥ = 0.001123·Q²/d⁴)"
+                : "Off — total pressure at each orifice (NFPA-permitted, more conservative)"}
+            </span>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -912,7 +1022,7 @@ function PipesEditor({ project, update, openFittings }) {
         <span className="desc">Hazen-Williams · loops allowed</span></div>
       <div style={{ overflowX: "auto" }}>
         <table className="tbl">
-          <thead><tr><th>From</th><th>To</th><th>Size</th><th>Material (C)</th><th>Length ({lab(sys, "length")})</th><th>Fittings</th><th></th></tr></thead>
+          <thead><tr><th>From</th><th>To</th><th>Size</th><th>Sched</th><th>Material (C)</th><th>Length ({lab(sys, "length")})</th><th>Fittings</th><th></th></tr></thead>
           <tbody>
             {pipes.map((p) => {
               const g = pipeGeom(p);
@@ -922,6 +1032,8 @@ function PipesEditor({ project, update, openFittings }) {
                   <td style={{ minWidth: 96 }}><select className="cellsel" value={p.to} onChange={(e) => setPipe(p.id, { to: e.target.value })}>{opts}</select></td>
                   <td style={{ width: 78 }}><select className="cellsel" value={p.sizeIdx} onChange={(e) => setPipe(p.id, { sizeIdx: +e.target.value })}>
                     {SCHED40.map((s, i) => <option key={i} value={i}>{s.nom}</option>)}</select></td>
+                  <td style={{ width: 92 }}><select className="cellsel" value={p.schedule || "sched40"} onChange={(e) => setPipe(p.id, { schedule: e.target.value })}>
+                    {Object.entries(SCHED).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}</select></td>
                   <td style={{ width: 128 }}><select className="cellsel" value={p.C} onChange={(e) => setPipe(p.id, { C: +e.target.value })}>
                     {MATERIALS.map((m, i) => <option key={i} value={m.c}>{m.label} · {m.c}</option>)}</select></td>
                   <td style={{ width: 80 }}><NumField className="cellinput" q="length" value={p.length} onChange={(v) => setPipe(p.id, { length: v })} /></td>
@@ -964,6 +1076,148 @@ function FittingModal({ pipe, pipes, update, close }) {
         </div>
       </div>
     </div>
+  );
+}
+
+/* ---- Sizer (parametric design tool) ---- */
+function PipeSpec({ label, seg, onChange }) {
+  return (
+    <div className="field">
+      <label>{label}</label>
+      <div style={{ display: "flex", gap: 6 }}>
+        <select className="cellsel" value={seg.sizeIdx} onChange={(e) => onChange({ sizeIdx: +e.target.value })} aria-label={`${label} size`}>
+          {SCHED40.map((s, i) => <option key={i} value={i}>{s.nom}</option>)}
+        </select>
+        <select className="cellsel" value={seg.schedule} onChange={(e) => onChange({ schedule: e.target.value })} aria-label={`${label} schedule`}>
+          {Object.entries(SCHED).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+        </select>
+        <select className="cellsel" value={seg.C} onChange={(e) => onChange({ C: +e.target.value })} aria-label={`${label} C-factor`}>
+          {MATERIALS.map((m, i) => <option key={i} value={m.c}>C{m.c}</option>)}
+        </select>
+      </div>
+    </div>
+  );
+}
+
+const LAYOUTS = [
+  { id: "tree", label: "Tree", desc: "Branch lines fed from one cross-main" },
+  { id: "grid", label: "Gridded", desc: "Branch lines fed from cross-mains on both ends" },
+  { id: "loop", label: "Looped", desc: "Cross-main looped back to the supply" },
+];
+
+function SizerPanel({ project, update, res }) {
+  const { sys } = useUnits();
+  const spec = project.sizer || defaultSizer();
+  const setS = (patch) => update({ sizer: { ...spec, ...patch } });
+  const setSeg = (grp, patch) => update({ sizer: { ...spec, [grp]: { ...spec[grp], ...patch } } });
+  const intField = (v) => Math.max(1, parseInt(v, 10) || 1);
+
+  const cov = Math.max(spec.sBranch * spec.sLine, 1);             // area per head ≈ S × L
+  const minQ = spec.density * cov;
+  const minP = Math.pow(minQ / (spec.K || 5.6), 2);
+  const designArea = spec.lines * spec.heads * cov;
+  const remoteLen = 1.2 * Math.sqrt(designArea);                  // NFPA 13 remote-area length
+  const recHeadsPerLine = Math.max(1, Math.ceil(remoteLen / Math.max(spec.sBranch, 1)));
+
+  const generate = () => {
+    const { nodes, pipes } = generateNetwork(spec);
+    update({
+      nodes, pipes, systemType: "CMDA",
+      design: { ...project.design, mode: "density", hazard: "CUS", density: spec.density,
+        coverageArea: round(cov, 2), designArea: round(designArea, 2) },
+    });
+  };
+
+  const maxVel = res?.ok && res.pipeRows?.length ? Math.max(...res.pipeRows.map((r) => r.vel)) : null;
+  const margin = res?.ok && !res.noDemand ? res.supply.margin : null;
+  const pass = margin != null && margin >= 0;
+
+  return (
+    <>
+      <div className="card">
+        <div className="head"><Wrench size={15} color="var(--fire)" /><h3>Sizer</h3>
+          <span className="desc">Generate a network from layout & pipe sizes, then calculate</span></div>
+        <div className="body">
+          {/* layout */}
+          <div className="field">
+            <label>Layout</label>
+            <div className="useg" role="group" aria-label="Layout">
+              {LAYOUTS.map((l) => (
+                <button key={l.id} className={spec.layout === l.id ? "on" : ""} title={l.desc}
+                  onClick={() => setS({ layout: l.id })}>{l.label}</button>
+              ))}
+            </div>
+            <span className="note" style={{ marginTop: 6 }}>{LAYOUTS.find((l) => l.id === spec.layout)?.desc}</span>
+          </div>
+
+          {/* grid dimensions */}
+          <div className="grid4" style={{ marginTop: 14 }}>
+            <div className="field"><label>Branch lines</label>
+              <input type="number" min="1" className="txt" style={{ fontFamily: "var(--mono)" }} value={spec.lines}
+                onChange={(e) => setS({ lines: intField(e.target.value) })} /></div>
+            <div className="field"><label>Heads / line</label>
+              <input type="number" min="1" className="txt" style={{ fontFamily: "var(--mono)" }} value={spec.heads}
+                onChange={(e) => setS({ heads: intField(e.target.value) })} /></div>
+            <div className="field"><label>Head spacing S ({lab(sys, "length")})</label>
+              <NumField q="length" value={spec.sBranch} onChange={(v) => setS({ sBranch: v })} /></div>
+            <div className="field"><label>Line spacing L ({lab(sys, "length")})</label>
+              <NumField q="length" value={spec.sLine} onChange={(v) => setS({ sLine: v })} /></div>
+          </div>
+
+          {/* head + supply geometry */}
+          <div className="grid4" style={{ marginTop: 12 }}>
+            <div className="field"><label>K-factor</label>
+              <input type="number" step="0.1" className="txt" style={{ fontFamily: "var(--mono)" }} value={spec.K}
+                onChange={(e) => setS({ K: parseFloat(e.target.value) || 0 })} /></div>
+            <div className="field"><label>Density ({lab(sys, "density")})</label>
+              <NumField q="density" value={spec.density} onChange={(v) => setS({ density: v })} /></div>
+            <div className="field"><label>System height ({lab(sys, "length")})</label>
+              <NumField q="length" value={spec.elevation} onChange={(v) => setS({ elevation: v })} /></div>
+            <div className="field"><label>Feed-main run ({lab(sys, "length")})</label>
+              <NumField q="length" value={spec.feedLength} onChange={(v) => setS({ feedLength: v })} /></div>
+          </div>
+
+          {/* pipe sizes per group */}
+          <div className="grid3" style={{ marginTop: 12 }}>
+            <PipeSpec label="Branch line pipe" seg={spec.branch} onChange={(p) => setSeg("branch", p)} />
+            <PipeSpec label="Cross-main pipe" seg={spec.main} onChange={(p) => setSeg("main", p)} />
+            <PipeSpec label="Feed-main / riser pipe" seg={spec.feed} onChange={(p) => setSeg("feed", p)} />
+          </div>
+
+          {/* derived design basis */}
+          <div className="derived">
+            <div className="d"><span className="v">{num(toDisp(sys, "area", cov), UPREC[sys].area)}</span><span className="l">area / head ({lab(sys, "area")})</span></div>
+            <div className="d"><span className="v">{num(toDisp(sys, "flow", minQ), UPREC[sys].flow)}</span><span className="l">min flow / head ({lab(sys, "flow")})</span></div>
+            <div className="d"><span className="v">{num(toDisp(sys, "pressure", minP), UPREC[sys].pressure)}</span><span className="l">remote pressure ({lab(sys, "pressure")})</span></div>
+            <div className="d"><span className="v">{num(toDisp(sys, "area", designArea), UPREC[sys].area)}</span><span className="l">design area ({lab(sys, "area")})</span></div>
+            <div className="d"><span className="v">{recHeadsPerLine}</span><span className="l">heads/line per 1.2√A</span></div>
+          </div>
+          <div className="note" style={{ marginTop: 10 }}><Settings2 size={14} style={{ flex: "none", marginTop: 1 }} />
+            <span>Generating replaces the current nodes &amp; pipes and sets the design basis to density/area. The 1.2√A rule suggests {recHeadsPerLine} heads on each branch line in the remote area — you have {spec.heads}. Fine-tune anything afterward in the Network tab.</span></div>
+        </div>
+        <div className="addbar"><button className="btn primary" onClick={generate}><Wrench size={14} /> Generate &amp; calculate</button></div>
+      </div>
+
+      {res?.ok && !res.noDemand && (
+        <div className="card">
+          <div className="head"><Gauge size={15} color="var(--water)" /><h3>Sizer result</h3>
+            <span className="desc">{res.looped ? "Gridded / looped — full nodal solution" : "Tree solution"}</span></div>
+          <div className="body">
+            <div className="derived">
+              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow)}</span><span className="l">system demand ({lab(sys, "flow")})</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure)}</span><span className="l">required pressure ({lab(sys, "pressure")})</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--water)" }}>{num(toDisp(sys, "pressure", res.supply.pAvail), UPREC[sys].pressure)}</span><span className="l">available ({lab(sys, "pressure")})</span></div>
+              <div className="d"><span className="v" style={{ color: margin == null ? "var(--mut)" : pass ? "var(--ok)" : "var(--danger)" }}>{margin == null ? "—" : (margin >= 0 ? "+" : "") + num(toDisp(sys, "pressure", margin), UPREC[sys].pressure)}</span><span className="l">margin ({lab(sys, "pressure")})</span></div>
+              <div className="d"><span className="v" style={{ color: maxVel != null && maxVel > 32 ? "var(--danger)" : "var(--gold)" }}>{maxVel == null ? "—" : num(toDisp(sys, "vel", maxVel), UPREC[sys].vel)}</span><span className="l">max velocity ({lab(sys, "vel")})</span></div>
+            </div>
+            {maxVel != null && maxVel > 32 && (
+              <div className="note" style={{ marginTop: 10 }}><AlertTriangle size={14} color="var(--gold)" style={{ flex: "none" }} />
+                <span>Peak velocity exceeds ~32 ft/s — consider upsizing the affected pipe group.</span></div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1298,6 +1552,7 @@ export default function App() {
 
   const tabs = [
     { id: "project", label: "Project", icon: Building2 },
+    { id: "sizer", label: "Sizer", icon: Wrench },
     { id: "network", label: "Network", icon: GitBranch },
     { id: "supply", label: "Water supply", icon: Droplets },
     { id: "results", label: "Results", icon: Gauge },
@@ -1347,6 +1602,10 @@ export default function App() {
           {res?.ok && res.looped && tab !== "project" && <div className="card"><div className="body"><div className="note"><Waves size={14} color="var(--water)" style={{ flex: "none" }} /><span>Gridded (looped) network — solved with the full nodal method.</span></div></div></div>}
 
           {tab === "project" && <ProjectPanel project={project} update={update} />}
+          {tab === "sizer" && <>
+            <SizerPanel project={project} update={update} res={res} />
+            <Schematic res={res} />
+          </>}
           {tab === "network" && <>
             <DesignBasisPanel project={project} update={update} res={res} />
             <NodesEditor project={project} update={update} />
