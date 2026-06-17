@@ -614,6 +614,7 @@ function defaultSizer() {
     main:   { schedule: "sched40", sizeIdx: 6, C: 120 }, // 4"
     feed:   { schedule: "sched40", sizeIdx: 8, C: 120 }, // 6"
     vLimit: 32,              // auto-size velocity ceiling (ft/s)
+    autoSizeOnGen: false,    // run auto-size automatically after Generate
   };
 }
 
@@ -1163,11 +1164,18 @@ function SizerPanel({ project, update, res }) {
 
   const generate = () => {
     const { nodes, pipes } = generateNetwork(spec);
-    update({
-      nodes, pipes, systemType: "CMDA",
-      design: { ...project.design, mode: "density", hazard: "CUS", density: spec.density,
-        coverageArea: round(cov, 2), designArea: round(designArea, 2) },
-    });
+    const design = { ...project.design, mode: "density", hazard: "CUS", density: spec.density,
+      coverageArea: round(cov, 2), designArea: round(designArea, 2) };
+    if (spec.autoSizeOnGen) {
+      setSizing(true);
+      const next = { ...project, nodes, pipes, systemType: "CMDA", design };
+      setTimeout(() => {
+        update({ nodes, pipes: autoSize(next, { vLimit: spec.vLimit || 32, marginTarget: 0 }), systemType: "CMDA", design });
+        setSizing(false);
+      }, 10);
+    } else {
+      update({ nodes, pipes, systemType: "CMDA", design });
+    }
   };
 
   const maxVel = res?.ok && res.pipeRows?.length ? Math.max(...res.pipeRows.map((r) => r.vel)) : null;
@@ -1225,9 +1233,15 @@ function SizerPanel({ project, update, res }) {
             <PipeSpec label="Cross-main pipe" seg={spec.main} onChange={(p) => setSeg("main", p)} />
             <PipeSpec label="Feed-main / riser pipe" seg={spec.feed} onChange={(p) => setSeg("feed", p)} />
           </div>
-          <div className="grid3" style={{ marginTop: 12, maxWidth: 360 }}>
+          <div className="grid2" style={{ marginTop: 12, maxWidth: 460 }}>
             <div className="field"><label>Auto-size velocity limit ({lab(sys, "vel")})</label>
               <NumField q="vel" value={spec.vLimit} onChange={(v) => setS({ vLimit: v })} /></div>
+            <div className="field"><label>Auto-size on generate</label>
+              <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+                <Toggle on={!!spec.autoSizeOnGen} onChange={(v) => setS({ autoSizeOnGen: v })} />
+                <span style={{ fontSize: 12, color: "var(--mut)" }}>{spec.autoSizeOnGen ? "Generate then size in one click" : "Generate at the sizes above"}</span>
+              </div>
+            </div>
           </div>
 
           {/* derived design basis */}
