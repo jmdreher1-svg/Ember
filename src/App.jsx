@@ -613,7 +613,42 @@ function defaultSizer() {
     branch: { schedule: "sched40", sizeIdx: 1, C: 120 }, // 1¼"
     main:   { schedule: "sched40", sizeIdx: 6, C: 120 }, // 4"
     feed:   { schedule: "sched40", sizeIdx: 8, C: 120 }, // 6"
+    vLimit: 32,              // auto-size velocity ceiling (ft/s)
   };
+}
+
+/* Auto-size: choose the smallest pipe size per segment that keeps velocity
+   within the limit, then relieve the highest-loss segments until the supply
+   margin is met. Works per-pipe, so branch lines step down toward the tip and
+   mains/feed grow as flow accumulates. Keeps each pipe's schedule and C. */
+function autoSize(project, { vLimit = 32, marginTarget = 0 } = {}) {
+  const maxIdx = SCHED40.length - 1;
+  let pipes = project.pipes.map((p) => ({ ...p, customId: 0, sizeIdx: 0 }));
+  const solve = (pp) => { try { return analyze({ ...project, pipes: pp }); } catch { return null; } };
+  // phase 1 — satisfy the velocity ceiling
+  for (let it = 0; it < 12; it++) {
+    const r = solve(pipes);
+    if (!r?.ok || r.noDemand) return project.pipes;           // nothing to size against
+    const v = Object.fromEntries(r.pipeRows.map((pr) => [pr.id, pr.vel]));
+    let changed = false;
+    pipes = pipes.map((p) => {
+      if ((v[p.id] || 0) > vLimit && p.sizeIdx < maxIdx) { changed = true; return { ...p, sizeIdx: p.sizeIdx + 1 }; }
+      return p;
+    });
+    if (!changed) break;
+  }
+  // phase 2 — meet the supply margin by upsizing the highest-loss segments
+  for (let it = 0; it < 12; it++) {
+    const r = solve(pipes);
+    if (!r?.ok || r.noDemand) break;
+    if (r.supply.margin >= marginTarget) break;
+    const av = r.pipeRows.filter((pr) => { const p = pipes.find((x) => x.id === pr.id); return p && p.sizeIdx < maxIdx; });
+    if (!av.length) break;                                     // everything maxed out
+    const cut = av.map((l) => l.loss).sort((a, b) => b - a)[Math.min(av.length - 1, Math.floor(av.length * 0.3))];
+    const bump = new Set(av.filter((l) => l.loss >= cut).map((l) => l.id));
+    pipes = pipes.map((p) => (bump.has(p.id) ? { ...p, sizeIdx: p.sizeIdx + 1 } : p));
+  }
+  return pipes;
 }
 
 function generateNetwork(spec) {
@@ -1111,6 +1146,13 @@ function SizerPanel({ project, update, res }) {
   const setS = (patch) => update({ sizer: { ...spec, ...patch } });
   const setSeg = (grp, patch) => update({ sizer: { ...spec, [grp]: { ...spec[grp], ...patch } } });
   const intField = (v) => Math.max(1, parseInt(v, 10) || 1);
+  const [sizing, setSizing] = useState(false);
+  const hasNet = (project.pipes || []).length > 0;
+  const autoSizeNow = () => {
+    setSizing(true);
+    // defer so the spinner paints before the synchronous solve loop runs
+    setTimeout(() => { update({ pipes: autoSize(project, { vLimit: spec.vLimit || 32, marginTarget: 0 }) }); setSizing(false); }, 10);
+  };
 
   const cov = Math.max(spec.sBranch * spec.sLine, 1);             // area per head ≈ S × L
   const minQ = spec.density * cov;
@@ -1177,11 +1219,15 @@ function SizerPanel({ project, update, res }) {
               <NumField q="length" value={spec.feedLength} onChange={(v) => setS({ feedLength: v })} /></div>
           </div>
 
-          {/* pipe sizes per group */}
+          {/* pipe sizes per group + auto-size ceiling */}
           <div className="grid3" style={{ marginTop: 12 }}>
             <PipeSpec label="Branch line pipe" seg={spec.branch} onChange={(p) => setSeg("branch", p)} />
             <PipeSpec label="Cross-main pipe" seg={spec.main} onChange={(p) => setSeg("main", p)} />
             <PipeSpec label="Feed-main / riser pipe" seg={spec.feed} onChange={(p) => setSeg("feed", p)} />
+          </div>
+          <div className="grid3" style={{ marginTop: 12, maxWidth: 360 }}>
+            <div className="field"><label>Auto-size velocity limit ({lab(sys, "vel")})</label>
+              <NumField q="vel" value={spec.vLimit} onChange={(v) => setS({ vLimit: v })} /></div>
           </div>
 
           {/* derived design basis */}
@@ -1193,9 +1239,13 @@ function SizerPanel({ project, update, res }) {
             <div className="d"><span className="v">{recHeadsPerLine}</span><span className="l">heads/line per 1.2√A</span></div>
           </div>
           <div className="note" style={{ marginTop: 10 }}><Settings2 size={14} style={{ flex: "none", marginTop: 1 }} />
-            <span>Generating replaces the current nodes &amp; pipes and sets the design basis to density/area. The 1.2√A rule suggests {recHeadsPerLine} heads on each branch line in the remote area — you have {spec.heads}. Fine-tune anything afterward in the Network tab.</span></div>
+            <span>Generating replaces the current nodes &amp; pipes and sets the design basis to density/area. The 1.2√A rule suggests {recHeadsPerLine} heads on each branch line in the remote area — you have {spec.heads}. <b>Auto-size</b> then assigns a size to every segment individually (branch lines step down toward the tip, mains grow toward the supply) to hold velocity under the limit and keep the supply margin positive. Fine-tune anything afterward in the Network tab.</span></div>
         </div>
-        <div className="addbar"><button className="btn primary" onClick={generate}><Wrench size={14} /> Generate &amp; calculate</button></div>
+        <div className="addbar">
+          <button className="btn primary" onClick={generate}><Wrench size={14} /> Generate &amp; calculate</button>
+          <button className="btn" onClick={autoSizeNow} disabled={sizing || !hasNet} title={hasNet ? "Size every pipe to meet velocity & margin" : "Generate a network first"}>
+            {sizing ? <Loader2 size={14} className="spin" /> : <Activity size={14} />} Auto-size pipes</button>
+        </div>
       </div>
 
       {res?.ok && !res.noDemand && (
