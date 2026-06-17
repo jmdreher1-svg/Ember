@@ -1,0 +1,56 @@
+name: Deploy to GitHub Pages
+
+# Builds the Vite frontend and publishes it to GitHub Pages.
+# GitHub Pages is static-only, so the Express backend (server.js) does not run
+# there: AI review and Save/Load are unavailable, but the hydraulic calculator,
+# schematic, results, and PDF export all run in the browser.
+#
+# Setup (one time): Repo Settings → Pages → "Build and deployment" →
+# Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # lets you deploy manually from any branch (e.g. before merge)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; cancel in-progress runs on new pushes.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Build (subpath base, no backend pointer)
+        env:
+          VITE_BASE: /Ember/
+        run: |
+          npm run build
+          # Static host has no /api backend — drop the pointer so Save/Load is
+          # hidden and AI review degrades gracefully instead of erroring.
+          sed -i '/__EMBER_API_BASE__/d' dist/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

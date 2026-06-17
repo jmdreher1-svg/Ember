@@ -5,6 +5,9 @@ import react from "@vitejs/plugin-react";
 // AI proxy and project persistence work with hot reload. In production
 // the same Express server serves the built UI and the API on one origin.
 export default defineConfig({
+  // "/" for the standalone Express build; GitHub Pages sets VITE_BASE="/Ember/"
+  // (project sites are served from https://<user>.github.io/<repo>/).
+  base: process.env.VITE_BASE || "/",
   plugins: [react()],
   server: {
     port: 5173,
