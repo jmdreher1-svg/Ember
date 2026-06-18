@@ -11,10 +11,13 @@ dependency on the Claude.ai runtime. It includes:
   selectable NFPA remote-area factor (1.0 / 1.2 / 1.4), highlighting it on the
   editable plan view;
 - **PDF export in two styles**, chosen from the dropdown next to *Export PDF*:
-  - **NFPA worksheet** — the AHJ-standard HydraCALC-style report: title page,
-    N^1.85 water-supply/demand curve, the node-to-node *Final Calculations:
-    Hazen-Williams* worksheet, *Flow Summary* (supply + node analysis), and the
-    fittings legend;
+  - **NFPA worksheet** — a modernized, AHJ-ready HydraCALC-style report with a
+    branded cover (project info + pass/fail result banner), the N^1.85
+    water-supply/demand curve (clipped to its plot so it never prints off the
+    page), a **plan-view shop drawing** that accompanies the node-to-node *Final
+    Calculations: Hazen-Williams* worksheet, a *Flow Summary* with a
+    hydraulic-design-information block plus supply and node analysis, and the
+    fittings/units legend;
   - **Branded report** — a modern letterhead summary with the plan-view drawing;
 - a small **AI proxy** so the "AI review" tab works while keeping your Anthropic
   API key on the server (never exposed to the browser);

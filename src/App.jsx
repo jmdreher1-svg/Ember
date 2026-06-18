@@ -317,7 +317,6 @@ function analyze(project) {
 
   const totalQ = activeSpr.reduce((a, s) => a + sol.spr[s.id], 0);
   const pipeRows = edges.map((e) => {
-    const Q = solveNetwork; // placeholder avoided
     const u = sol.HGL[e.a] - sol.HGL[e.b];
     const flow = Math.sign(u) * Math.pow(Math.max(Math.abs(u), 1e-12) / e.g.R, M);
     return { id: e.id, a: e.a, b: e.b,
@@ -735,7 +734,11 @@ async function exportHydraCalcPDF(project, res, sys) {
   const PW = doc.internal.pageSize.getWidth();   // 612
   const PH = doc.internal.pageSize.getHeight();  // 792
   const ML = 40, MR = PW - 40;
-  const INK = [20, 20, 20], GRAY = [110, 110, 110], LINE = [180, 180, 180];
+  /* modern palette — slate ink, amber accent, teal water */
+  const AMBER = [234, 88, 12], AMBER_SOFT = [254, 237, 222];
+  const SLATE = [30, 41, 59], TEAL = [13, 117, 146];
+  const INK = [17, 24, 39], GRAY = [100, 116, 139], LINE = [203, 213, 225];
+  const ZEBRA = [248, 250, 252], OKC = [22, 163, 74], BADC = [220, 38, 38];
   const fmt = (q, v, dec) => (v == null || isNaN(v) ? "" : toDisp(sys, q, v).toFixed(dec ?? UPREC[sys][q]));
   const U = (q) => lab(sys, q);
   const company = project.company || "DGA Consulting";
@@ -743,157 +746,255 @@ async function exportHydraCalcPDF(project, res, sys) {
   const dateStr = project.reportDate || today();
   let pageNo = 0;
 
-  /* shared page header on every content page (title + company/job + page/date) */
+  /* a small stylized flame mark (matches the on-screen brand) */
+  const flameMark = (cx, baseY, h, color = AMBER, inner = [255, 178, 92]) => {
+    doc.setFillColor(...color); doc.triangle(cx - h * 0.32, baseY, cx + h * 0.32, baseY, cx, baseY - h, "F");
+    doc.setFillColor(...inner); doc.triangle(cx - h * 0.16, baseY, cx + h * 0.16, baseY, cx, baseY - h * 0.55, "F");
+  };
+
+  /* shared modern header band + section title on every content page */
   const startPage = (title, first = false) => {
     if (!first) doc.addPage();
     pageNo += 1;
-    doc.setTextColor(...INK);
-    doc.setFont("helvetica", "normal"); doc.setFontSize(15);
-    doc.text(title, ML, 44);
-    doc.setDrawColor(...LINE); doc.setLineWidth(0.6); doc.line(ML, 52, MR, 52);
-    doc.setFontSize(9);
-    doc.text(company, ML, 66);
-    doc.text(job, ML, 78);
-    doc.text("Page", MR - 78, 66); doc.text(String(pageNo), MR - 44, 66);
-    doc.text("Date", MR - 78, 78); doc.text(dateStr, MR - 44, 78);
-    doc.setLineWidth(1.4); doc.line(ML, 86, MR, 86);
-    doc.setLineWidth(0.5);
-    return 104; // first content y
+    doc.setFillColor(...SLATE); doc.rect(0, 0, PW, 50, "F");
+    doc.setFillColor(...AMBER); doc.rect(0, 50, PW, 3, "F");
+    flameMark(ML + 9, 35, 20);
+    doc.setTextColor(255, 255, 255); doc.setFont("helvetica", "bold"); doc.setFontSize(13);
+    doc.text("EMBER", ML + 24, 25);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(203, 213, 225);
+    doc.text(company.toUpperCase(), ML + 24, 36);
+    doc.setFontSize(8); doc.setTextColor(226, 232, 240);
+    doc.text(job, MR, 20, { align: "right" });
+    doc.setFontSize(7.5); doc.setTextColor(203, 213, 225);
+    doc.text(`Page ${pageNo}   ·   ${dateStr}`, MR, 33, { align: "right" });
+    doc.setTextColor(...SLATE); doc.setFont("helvetica", "bold"); doc.setFontSize(14);
+    doc.text(title, ML, 76);
+    doc.setDrawColor(...LINE); doc.setLineWidth(0.8); doc.line(ML, 84, MR, 84);
+    doc.setLineWidth(0.5); doc.setTextColor(...INK);
+    return 102; // first content y
   };
   const footer = (revLike) => {
-    doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...GRAY);
-    doc.text(revLike || "Hydraulic Calculations by EMBER  ·  DGA Consulting", PW / 2, PH - 28, { align: "center" });
+    doc.setDrawColor(...LINE); doc.setLineWidth(0.5); doc.line(ML, PH - 34, MR, PH - 34);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+    doc.text(revLike || "Hazen-Williams analysis per NFPA 13 methodology · to be reviewed and sealed by a licensed professional engineer.", ML, PH - 22);
+    doc.text(`${company} · EMBER`, ML, PH - 12);
+    doc.text(`Page ${pageNo}`, MR, PH - 12, { align: "right" });
     doc.setTextColor(...INK);
+  };
+  /* rounded status / value pill */
+  const chip = (x, y, text, fill, tcol = [255, 255, 255], w) => {
+    doc.setFont("helvetica", "bold"); doc.setFontSize(9);
+    const ww = w || doc.getTextWidth(text) + 18;
+    doc.setFillColor(...fill); doc.roundedRect(x, y - 11, ww, 16, 3, 3, "F");
+    doc.setTextColor(...tcol); doc.text(text, x + ww / 2, y, { align: "center" });
+    doc.setTextColor(...INK);
+    return ww;
   };
 
   /* ---------- 1 · COVER ---------- */
   pageNo = 1;
-  // EMBER wordmark / flame glyph
-  doc.setDrawColor(234, 88, 12); doc.setLineWidth(2.4);
-  doc.setFillColor(234, 88, 12);
-  // simple flame: a rounded triangle
-  doc.triangle(PW / 2 - 22, 188, PW / 2 + 22, 188, PW / 2, 120, "F");
-  doc.setFillColor(255, 170, 80);
-  doc.triangle(PW / 2 - 11, 188, PW / 2 + 11, 188, PW / 2, 150, "F");
-  doc.setTextColor(...INK);
-  doc.setFont("helvetica", "bold"); doc.setFontSize(30);
-  doc.text("EMBER", PW / 2, 232, { align: "center" });
-  doc.setFont("helvetica", "normal"); doc.setFontSize(15);
-  doc.text("Hydraulic Calculations", PW / 2, 256, { align: "center" });
-
-  // contractor box
-  const cbX = PW / 2 - 150, cbW = 300;
-  doc.setDrawColor(...INK); doc.setLineWidth(1);
-  doc.rect(cbX, 300, cbW, 70);
-  doc.setFontSize(11);
-  doc.text(company, cbX + 16, 324);
-  doc.setFontSize(10); doc.setTextColor(...GRAY);
-  doc.text(project.location || "Mechanicsburg, PA 17055", cbX + 16, 340);
-  doc.text(project.preparedBy ? `Prepared by: ${project.preparedBy}` : "Fire Protection Engineering", cbX + 16, 356);
+  // thin slate + amber masthead rule
+  doc.setFillColor(...SLATE); doc.rect(0, 0, PW, 7, "F");
+  doc.setFillColor(...AMBER); doc.rect(0, 7, PW, 2.5, "F");
+  // flame + wordmark
+  flameMark(PW / 2, 190, 76);
+  doc.setTextColor(...INK); doc.setFont("helvetica", "bold"); doc.setFontSize(34);
+  doc.text("EMBER", PW / 2, 234, { align: "center" });
+  doc.setFont("helvetica", "normal"); doc.setFontSize(13); doc.setTextColor(...GRAY);
+  doc.text("Hydraulic Calculation Report", PW / 2, 256, { align: "center" });
+  doc.setFontSize(9.5); doc.setTextColor(...AMBER);
+  doc.text(`${project.systemType || "CMDA"}  ·  NFPA 13 methodology`, PW / 2, 272, { align: "center" });
   doc.setTextColor(...INK);
 
-  // job info box
-  const jbX = PW / 2 - 210, jbW = 420, jbY = 430;
-  doc.rect(jbX, jbY, jbW, 132);
+  // project information card
+  const jbX = PW / 2 - 215, jbW = 430, jbY = 300;
   const info = [
     ["Job Name", job],
-    ["Drawing", project.drawingNumber || ""],
-    ["Location", project.location || ""],
+    ["Project No.", project.projectNumber || "—"],
+    ["Client", project.client || "—"],
+    ["Drawing", project.drawingNumber || "—"],
+    ["Location", project.location || "—"],
     ["Remote Area", project.systemType === "CMDA" && project.design.mode === "density"
-      ? `${fmt("area", project.design.designArea)} ${U("area")}  (factor ${project.sizer?.remoteAreaFactor ?? 1.2})` : ""],
-    ["Contract", project.projectNumber || ""],
-    ["Data File", project.name ? `${project.name}.ember` : ""],
-    ["Date/Time", `${dateStr}`],
+      ? `${fmt("area", project.design.designArea)} ${U("area")}  (factor ${project.sizer?.remoteAreaFactor ?? 1.2})` : "—"],
+    ["Prepared by", project.preparedBy || "—"],
+    ["PE / License", project.peNumber || "—"],
+    ["Date", dateStr],
   ];
-  doc.setFontSize(10);
-  let iy = jbY + 22;
-  info.forEach(([k, v]) => {
-    doc.setFont("helvetica", "bold"); doc.text(k, jbX + 16, iy);
-    doc.setFont("helvetica", "normal"); doc.text(":", jbX + 96, iy);
-    doc.text(String(v || ""), jbX + 104, iy);
-    iy += 16;
+  const rowH = 19, jbH = 24 + info.length * rowH + 8;
+  doc.setDrawColor(...LINE); doc.setLineWidth(1);
+  doc.roundedRect(jbX, jbY, jbW, jbH, 5, 5, "S");
+  doc.setFillColor(...SLATE); doc.roundedRect(jbX, jbY, jbW, 24, 5, 5, "F"); doc.rect(jbX, jbY + 14, jbW, 10, "F");
+  doc.setTextColor(255, 255, 255); doc.setFont("helvetica", "bold"); doc.setFontSize(9.5);
+  doc.text("PROJECT INFORMATION", jbX + 14, jbY + 16);
+  let iy = jbY + 24 + 14;
+  doc.setFontSize(9.5);
+  info.forEach(([k, v], i) => {
+    if (i % 2 === 1) { doc.setFillColor(...ZEBRA); doc.rect(jbX + 1, iy - 12, jbW - 2, rowH, "F"); }
+    doc.setFont("helvetica", "bold"); doc.setTextColor(...GRAY); doc.text(k, jbX + 14, iy);
+    doc.setFont("helvetica", "normal"); doc.setTextColor(...INK); doc.text(String(v || "—"), jbX + 140, iy);
+    iy += rowH;
   });
-  footer("Hydraulic Calculations by EMBER  ·  DGA Consulting fire-protection engine");
+
+  // results banner (KPIs + pass/fail)
+  const okCover = res?.ok && !res.noDemand;
+  if (okCover) {
+    const margin = res.supply.margin, pass = margin >= 0;
+    const by = jbY + jbH + 30;
+    chip(PW / 2 - 95, by, pass ? "PASS — SUPPLY MEETS DEMAND" : "FAIL — DEMAND EXCEEDS SUPPLY", pass ? OKC : BADC, [255, 255, 255], 190);
+    const kpis = [
+      ["REQUIRED", `${fmt("pressure", res.requiredPs)} ${U("pressure")}`, SLATE],
+      ["DEMAND", `${fmt("flow", res.totalQ)} ${U("flow")}`, SLATE],
+      ["AVAILABLE", `${fmt("pressure", res.supply.pAvail)} ${U("pressure")}`, SLATE],
+      ["MARGIN", `${margin >= 0 ? "+" : ""}${fmt("pressure", margin)} ${U("pressure")}`, pass ? OKC : BADC],
+    ];
+    const cw = jbW / 4, ky = by + 22;
+    kpis.forEach(([k, v, col], i) => {
+      const cx = jbX + i * cw;
+      doc.setFillColor(...(i === 3 ? (pass ? [236, 253, 243] : [254, 242, 242]) : ZEBRA));
+      doc.roundedRect(cx + 3, ky, cw - 6, 48, 3, 3, "F");
+      doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+      doc.text(k, cx + cw / 2, ky + 16, { align: "center" });
+      doc.setFont("helvetica", "bold"); doc.setFontSize(13); doc.setTextColor(...col);
+      doc.text(v, cx + cw / 2, ky + 35, { align: "center" });
+    });
+    doc.setTextColor(...INK);
+  }
+  footer("Hydraulic Calculations by EMBER · DGA Consulting fire-protection engineering");
 
   /* ---------- 2 · WATER SUPPLY CURVE ---------- */
   if (res?.ok) {
     let yy = startPage("Water Supply Curve");
     const sp = supplyCurvePoints(res, project);
     const s = project.supply;
-    // info boxes
-    doc.setFontSize(9.5); doc.setFont("helvetica", "bold");
-    doc.text("City Water Supply:", ML + 6, yy);
-    doc.setFont("helvetica", "normal");
-    const cwl = [
-      [`C1 - Static Pressure`, fmt("pressure", sp.staticP)],
-      [`C2 - Residual Pressure`, fmt("pressure", sp.testRes)],
-      [`C2 - Residual Flow`, fmt("flow", sp.testFlow)],
-    ];
-    cwl.forEach(([k, v], i) => { doc.text(k, ML + 18, yy + 14 + i * 13); doc.text(`: ${v}`, ML + 150, yy + 14 + i * 13); });
-    doc.setFont("helvetica", "bold");
-    doc.text("Demand:", PW / 2 + 40, yy);
-    doc.setFont("helvetica", "normal");
-    const dml = [
-      [`D1 - Elevation`, fmt("pressure", sp.d1Elev)],
-      [`D2 - System Flow`, fmt("flow", sp.d2Flow)],
-      [`D2 - System Pressure`, fmt("pressure", sp.d2P)],
-      [`Hose ( Demand )`, fmt("flow", s.hose)],
-      [`D3 - System Demand`, fmt("flow", sp.d3Flow)],
-      [`Safety Margin`, sp.margin == null ? "" : fmt("pressure", sp.margin)],
-    ];
-    dml.forEach(([k, v], i) => { doc.text(k, PW / 2 + 52, yy + 14 + i * 13); doc.text(`: ${v}`, PW / 2 + 180, yy + 14 + i * 13); });
+    // two summary cards (City Water Supply · System Demand)
+    const cardW = (MR - ML - 16) / 2, cardH = 90;
+    const drawCard = (x, title, rows, accent) => {
+      doc.setDrawColor(...LINE); doc.setLineWidth(0.8);
+      doc.roundedRect(x, yy, cardW, cardH, 4, 4, "S");
+      doc.setFillColor(...accent); doc.rect(x, yy + 4, 3.5, cardH - 8, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(9.5); doc.setTextColor(...SLATE);
+      doc.text(title, x + 14, yy + 18);
+      doc.setDrawColor(...LINE); doc.setLineWidth(0.5); doc.line(x + 14, yy + 24, x + cardW - 12, yy + 24);
+      doc.setFontSize(8.5);
+      rows.forEach(([k, v], i) => {
+        const ry = yy + 39 + i * 13;
+        doc.setFont("helvetica", "normal"); doc.setTextColor(...GRAY); doc.text(k, x + 14, ry);
+        doc.setFont("helvetica", "bold"); doc.setTextColor(...INK); doc.text(String(v || "—"), x + cardW - 14, ry, { align: "right" });
+      });
+      doc.setTextColor(...INK);
+    };
+    drawCard(ML, "City Water Supply", [
+      [`C1 — Static (${U("pressure")})`, fmt("pressure", sp.staticP)],
+      [`C2 — Residual (${U("pressure")})`, fmt("pressure", sp.testRes)],
+      [`C2 — Test flow (${U("flow")})`, fmt("flow", sp.testFlow)],
+    ], TEAL);
+    drawCard(ML + cardW + 16, "System Demand", [
+      [`D1 — Elevation (${U("pressure")})`, fmt("pressure", sp.d1Elev)],
+      [`D2 — System (${U("flow")} @ ${U("pressure")})`, `${fmt("flow", sp.d2Flow)} @ ${fmt("pressure", sp.d2P)}`],
+      [`Hose allowance (${U("flow")})`, fmt("flow", s.hose)],
+      [`D3 — Demand (${U("flow")})`, fmt("flow", sp.d3Flow)],
+      [`Safety margin (${U("pressure")})`, sp.margin == null ? "—" : `${sp.margin >= 0 ? "+" : ""}${fmt("pressure", sp.margin)}`],
+    ], AMBER);
+    yy += cardH + 22;
 
-    // graph box
-    const gx = ML + 30, gy = yy + 100, gw = MR - gx - 8, gh = PH - gy - 70;
+    // ---- graph (flow axis on the N^1.85 scale) ----
+    const gx = ML + 36, gy = yy + 4, gw = MR - gx - 6, gh = PH - gy - 74;
     const flowD = (v) => toDisp(sys, "flow", v), pD = (v) => toDisp(sys, "pressure", v);
-    const maxP = Math.max(niceTicks(pD(Math.max(sp.staticP, sp.d2P, 10)) * 1.05)[Math.max(1, niceTicks(pD(Math.max(sp.staticP, sp.d2P, 10)) * 1.05).length - 1)] || 150, pD(sp.staticP) * 1.1);
-    const pTicks = niceTicks(maxP, 10);
-    const pTop = pTicks[pTicks.length - 1] || maxP;
-    const maxQd = Math.max(flowD(sp.testFlow) * 1.05, flowD(sp.d3Flow) * 1.25, 100);
-    const qTicks = niceTicks(maxQd, 9);
-    const qTop = Math.pow(qTicks[qTicks.length - 1] || maxQd, HW_N);
+    const pPeak = Math.max(pD(sp.staticP), pD(sp.d2P), 10) * 1.1;
+    const pTicks = niceTicks(pPeak, 8);
+    const pTop = pTicks[pTicks.length - 1] || pPeak;
+    const qPeak = Math.max(flowD(sp.testFlow) * 1.05, flowD(sp.d3Flow) * 1.2, 100);
+    const qTicks = niceTicks(qPeak, 9);
+    const qMaxDisp = qTicks[qTicks.length - 1] || qPeak;     // top flow tick — also the plot's right edge
+    const qTop = Math.pow(qMaxDisp, HW_N);
     const PX = (qDisp) => gx + (Math.pow(Math.max(qDisp, 0), HW_N) / qTop) * gw;
-    const PY = (pDisp) => gy + gh - (Math.max(pDisp, 0) / pTop) * gh;
-    // grid + axes
-    doc.setDrawColor(...LINE); doc.setLineWidth(0.4);
-    doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+    const PY = (pDisp) => gy + gh - (Math.min(Math.max(pDisp, 0), pTop) / pTop) * gh;
+    const clampX = (x) => Math.max(gx, Math.min(gx + gw, x));   // keep every drawn point inside the plot
+    // plot background + grid
+    doc.setFillColor(...ZEBRA); doc.rect(gx, gy, gw, gh, "F");
+    doc.setDrawColor(...LINE); doc.setLineWidth(0.4); doc.setFontSize(7.5); doc.setTextColor(...GRAY);
     pTicks.forEach((t) => { const y = PY(t); doc.line(gx, y, gx + gw, y); doc.text(String(Math.round(t)), gx - 6, y + 2.5, { align: "right" }); });
     let lastTx = -99;
-    qTicks.forEach((t) => { if (t <= 0) return; const x = PX(t); doc.line(x, gy, x, gy + gh); if (x - lastTx >= 22) { doc.text(String(Math.round(t)), x, gy + gh + 12, { align: "center" }); lastTx = x; } });
-    doc.setDrawColor(...INK); doc.setLineWidth(1); doc.rect(gx, gy, gw, gh);
-    doc.setTextColor(...INK); doc.setFontSize(8.5);
-    doc.text(`FLOW ( ${U("flow")} ) — N^1.85 scale`, gx + gw / 2, gy + gh + 28, { align: "center" });
-    // supply line (sample availAt across the range)
-    doc.setDrawColor(...INK); doc.setLineWidth(1.1);
-    let prev = null;
-    for (let i = 0; i <= 40; i++) {
-      const q = (sp.testFlow * 1.6 / 40) * i;
-      const pt = { x: PX(flowD(q)), y: PY(pD(sp.availAt(q))) };
+    qTicks.forEach((t) => { if (t <= 0) return; const x = PX(t); doc.line(x, gy, x, gy + gh); if (x - lastTx >= 24) { doc.text(String(Math.round(t)), x, gy + gh + 12, { align: "center" }); lastTx = x; } });
+    // frame + axis titles
+    doc.setDrawColor(...SLATE); doc.setLineWidth(1); doc.rect(gx, gy, gw, gh);
+    doc.setTextColor(...SLATE); doc.setFontSize(8.5); doc.setFont("helvetica", "bold");
+    doc.text(`FLOW ( ${U("flow")} ) — N^1.85 SCALE`, gx + gw / 2, gy + gh + 28, { align: "center" });
+    doc.text(`PRESSURE ( ${U("pressure")} )`, gx - 26, gy + gh / 2, { align: "center", angle: 90 });
+    doc.setFont("helvetica", "normal");
+    // supply curve — sampled only across the plotted flow range, so it never leaves the box
+    const qMaxUS = toUS(sys, "flow", qMaxDisp);
+    doc.setDrawColor(...TEAL); doc.setLineWidth(1.8); let prev = null;
+    for (let i = 0; i <= 60; i++) {
+      const qUS = (qMaxUS / 60) * i;
+      const pt = { x: clampX(PX(flowD(qUS))), y: PY(pD(sp.availAt(qUS))) };
       if (prev) doc.line(prev.x, prev.y, pt.x, pt.y);
       prev = pt;
     }
-    const mark = (qDisp, pDisp, tag, dx = 4, dy = -4) => {
-      const x = PX(qDisp), y = PY(pDisp);
-      doc.setDrawColor(...INK); doc.setLineWidth(0.8);
-      doc.circle(x, y, 2.4, "S");
-      doc.setFont("helvetica", "bold"); doc.setFontSize(8.5);
-      doc.text(tag, x + dx, y + dy);
-      doc.setFont("helvetica", "normal");
+    const mark = (qDisp, pDisp, tag, fill, dx = 5, dy = -4) => {
+      const x = clampX(PX(qDisp)), y = PY(pDisp);
+      doc.setFillColor(...fill); doc.circle(x, y, 2.6, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...SLATE);
+      doc.text(tag, Math.min(x + dx, gx + gw - 14), Math.max(y + dy, gy + 8));
+      doc.setFont("helvetica", "normal"); doc.setTextColor(...INK);
     };
-    mark(flowD(0), pD(sp.staticP), "C1");
-    mark(flowD(sp.testFlow), pD(sp.testRes), "C2");
+    mark(flowD(0), pD(sp.staticP), "C1", TEAL);
+    mark(flowD(sp.testFlow), pD(sp.testRes), "C2", TEAL);
     if (sp.hasDemand) {
-      // demand line D1 → D2
-      doc.setDrawColor(...INK); doc.setLineWidth(0.9);
-      doc.line(PX(flowD(0)), PY(pD(sp.d1Elev)), PX(flowD(sp.d2Flow)), PY(pD(sp.d2P)));
-      mark(flowD(0), pD(sp.d1Elev), "D1", 4, 10);
-      mark(flowD(sp.d2Flow), pD(sp.d2P), "D2");
-      mark(flowD(sp.d3Flow), pD(sp.d2P), "D3", 4, 12);
+      doc.setDrawColor(...AMBER); doc.setLineWidth(1.1);
+      doc.line(clampX(PX(flowD(0))), PY(pD(sp.d1Elev)), clampX(PX(flowD(sp.d2Flow))), PY(pD(sp.d2P)));
+      mark(flowD(0), pD(sp.d1Elev), "D1", AMBER, 5, 12);
+      mark(flowD(sp.d2Flow), pD(sp.d2P), "D2", AMBER);
+      mark(flowD(sp.d3Flow), pD(sp.d2P), "D3", AMBER, 5, 13);
+    }
+    // legend (top-right, inside the plot)
+    const lgW = 138, lgX = gx + gw - lgW - 8, lgY = gy + 16, lgH = sp.hasDemand ? 32 : 18;
+    doc.setFillColor(255, 255, 255); doc.setDrawColor(...LINE); doc.setLineWidth(0.6);
+    doc.roundedRect(lgX, lgY - 11, lgW, lgH, 3, 3, "FD");
+    doc.setDrawColor(...TEAL); doc.setLineWidth(1.8); doc.line(lgX + 8, lgY, lgX + 26, lgY);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...INK);
+    doc.text("Available supply", lgX + 32, lgY + 2.5);
+    if (sp.hasDemand) {
+      doc.setDrawColor(...AMBER); doc.setLineWidth(1.1); doc.line(lgX + 8, lgY + 14, lgX + 26, lgY + 14);
+      doc.text("System demand", lgX + 32, lgY + 16.5);
     }
     footer();
   }
 
-  /* ---------- 3 · FINAL CALCULATIONS : HAZEN-WILLIAMS ---------- */
+  /* ---------- 3 · PLAN VIEW — SHOP DRAWING (diagram for the node-to-node analysis) ---------- */
+  if (res?.ok && !res.noDemand) {
+    try {
+      const sv = schematicSVGString(res, sys, project);
+      const png = sv ? await svgToPng(sv.svg, sv.W, sv.H) : null;
+      if (png) {
+        let yy = startPage("Plan View — Shop Drawing");
+        doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); doc.setTextColor(...GRAY);
+        doc.text("Node-to-node layout for the calculations that follow. Pipe labels show nominal size · length · flow; node labels show pressure.",
+          ML, yy, { maxWidth: MR - ML });
+        yy += 16;
+        const availH = PH - yy - 96;
+        const scale = Math.min((MR - ML) / sv.W, availH / sv.H);
+        const w = sv.W * scale, h = sv.H * scale, ix = ML + ((MR - ML) - w) / 2;
+        doc.setDrawColor(...LINE); doc.setLineWidth(0.8); doc.rect(ix - 4, yy - 4, w + 8, h + 8, "S");
+        doc.addImage(png, "PNG", ix, yy, w, h);
+        yy += h + 28;
+        // legend
+        let lx = ML;
+        const legendItem = (draw, label) => {
+          draw(lx); doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); doc.setTextColor(...INK);
+          doc.text(label, lx + 16, yy);
+          lx += doc.getTextWidth(label) + 50;
+        };
+        legendItem((x) => { doc.setFillColor(234, 88, 12); doc.rect(x, yy - 8, 10, 10, "F"); }, "Supply / source");
+        legendItem((x) => { doc.setFillColor(8, 145, 178); doc.circle(x + 5, yy - 3, 5, "F"); }, "Flowing sprinkler");
+        legendItem((x) => { doc.setFillColor(148, 163, 184); doc.rect(x + 1, yy - 7, 8, 8, "F"); }, "Junction");
+        doc.setTextColor(...INK);
+        footer();
+      }
+    } catch { /* diagram is best-effort; skip if it can't be rasterized */ }
+  }
+
+  /* ---------- 4 · FINAL CALCULATIONS : HAZEN-WILLIAMS ---------- */
   const path = nodePath(res);
   if (res?.ok && !res.noDemand && path) {
     const pipeById = Object.fromEntries((project.pipes || []).map((p) => [p.id, p]));
@@ -903,7 +1004,8 @@ async function exportHydraCalcPDF(project, res, sys) {
     const RH = 11; // row height
     let yy = startPage("Final Calculations : Hazen-Williams");
     const colHead = () => {
-      doc.setFont("helvetica", "bold"); doc.setFontSize(7.6); doc.setTextColor(...INK);
+      doc.setFillColor(241, 245, 249); doc.rect(ML, yy - 9, MR - ML, 30, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(7.6); doc.setTextColor(...SLATE);
       const r1 = yy, r2 = yy + 9, r3 = yy + 18;
       doc.text("Node1", C.node, r1); doc.text("to", C.node, r2); doc.text("Node2", C.node, r3);
       doc.text("Elev1", C.elev, r1); doc.text("Elev2", C.elev, r3);
@@ -917,10 +1019,11 @@ async function exportHydraCalcPDF(project, res, sys) {
       doc.text("Pt", C.ppf, r1, { align: "right" }); doc.text("Pe", C.ppf, r2, { align: "right" }); doc.text("Pf", C.ppf, r3, { align: "right" });
       doc.text("Notes", C.note + 22, r2);
       yy = r3 + 6;
-      doc.setLineWidth(1.2); doc.setDrawColor(...INK); doc.line(ML, yy, MR, yy); yy += 12;
-      doc.setFont("courier", "normal"); doc.setFontSize(7.4);
+      doc.setLineWidth(1.2); doc.setDrawColor(...SLATE); doc.line(ML, yy, MR, yy); yy += 12;
+      doc.setFont("courier", "normal"); doc.setFontSize(7.4); doc.setTextColor(...INK);
     };
     colHead();
+    let segIdx = 0;
     const ensure = (h) => { if (yy + h > PH - 56) { footer(); yy = startPage("Final Calculations : Hazen-Williams"); colHead(); } };
     const R = (x, y, t) => { if (t !== "" && t != null) doc.text(String(t), x, y, { align: "right" }); };
     const L = (x, y, t) => { if (t !== "" && t != null) doc.text(String(t), x, y); };
@@ -928,6 +1031,7 @@ async function exportHydraCalcPDF(project, res, sys) {
     for (const block of path.blocks) {
       for (const seg of block.segs) {
         ensure(RH * 3 + 4);
+        if (segIdx++ % 2 === 1) { doc.setFillColor(...ZEBRA); doc.rect(ML, yy - 9, MR - ML, RH * 3 + 3, "F"); }
         const e = seg.e, pp = pipeById[e.id];
         const n1 = seg.from, n2 = seg.to;
         const z1 = res.N[n1].z, z2 = res.N[n2].z;
@@ -978,6 +1082,7 @@ async function exportHydraCalcPDF(project, res, sys) {
       }
       // tie-in / junction summary line: accumulated flow, pressure, effective K
       ensure(RH * 2 + 4);
+      doc.setFillColor(...AMBER_SOFT); doc.rect(ML, yy - 9, MR - ML, RH * 2 + 7, "F");
       const tie = block.tie;
       const lastSeg = block.segs[block.segs.length - 1];
       const tieQ = lastSeg.Qt, tieP = res.P[tie];
@@ -998,80 +1103,127 @@ async function exportHydraCalcPDF(project, res, sys) {
     footer();
   }
 
-  /* ---------- 4 · FLOW SUMMARY (supply + node analysis) ---------- */
+  /* ---------- 5 · FLOW SUMMARY (design info + supply + node analysis) ---------- */
   if (res?.ok && !res.noDemand) {
-    let yy = startPage("Flow Summary - NFPA");
-    doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...INK);
-    doc.text("SUPPLY ANALYSIS", PW / 2, yy + 4, { align: "center" }); yy += 22;
-    doc.setFontSize(8);
-    const sa = supplyCurvePoints(res, project);
-    const saCols = [["Node at Source", ML], ["Static", ML + 110], ["Residual", ML + 175], ["Flow", ML + 245],
-      ["Available", ML + 320], ["Total Demand", ML + 400], ["Required", ML + 490]];
-    saCols.forEach(([t, x]) => doc.text(t, x, yy));
-    yy += 4; doc.setDrawColor(...INK); doc.setLineWidth(0.8); doc.line(ML, yy, MR, yy); yy += 14;
-    doc.setFont("helvetica", "normal");
-    doc.text(project.supply.type === "pump" ? "PUMP" : "SUPPLY", ML, yy);
-    doc.text(fmt("pressure", sa.staticP), ML + 110, yy);
-    doc.text(fmt("pressure", sa.testRes), ML + 175, yy);
-    doc.text(fmt("flow", sa.testFlow), ML + 245, yy);
-    doc.text(fmt("pressure", res.supply.pAvail), ML + 320, yy);
-    doc.text(fmt("flow", res.supply.demandQ), ML + 400, yy);
-    doc.text(fmt("pressure", res.requiredPs), ML + 490, yy);
-    yy += 30;
+    let yy = startPage("Flow Summary — NFPA");
+    // section title helper (amber underline)
+    const subHead = (t, w) => {
+      doc.setFont("helvetica", "bold"); doc.setFontSize(10.5); doc.setTextColor(...SLATE);
+      doc.text(t, ML, yy); yy += 6;
+      doc.setDrawColor(...AMBER); doc.setLineWidth(1.4); doc.line(ML, yy, ML + (w || 110), yy); yy += 14;
+    };
 
-    doc.setFont("helvetica", "bold"); doc.setFontSize(10);
-    doc.text("NODE ANALYSIS", PW / 2, yy, { align: "center" }); yy += 20;
-    doc.setFontSize(8);
-    const naCols = [["Node Tag", ML], ["Elevation", ML + 90], ["K Factor", ML + 175],
-      ["Pressure", ML + 260], ["Discharge", ML + 345], ["Notes", ML + 440]];
-    naCols.forEach(([t, x]) => doc.text(t, x, yy));
-    yy += 4; doc.setLineWidth(0.8); doc.line(ML, yy, MR, yy); yy += 12;
-    doc.setFont("helvetica", "normal");
+    /* --- Hydraulic Design Information --- */
+    subHead("Hydraulic Design Information", 168);
+    const d = project.design;
+    const kGov = res.activeSpr?.length ? Math.min(...res.activeSpr.map((x) => x.k)) : 5.6;
+    const di = [["System type", project.systemType]];
+    if (project.systemType === "CMDA" && d.mode === "density") {
+      const dc = densityCalc(d, kGov);
+      di.push([`Density`, `${fmt("density", d.density)} ${U("density")}`]);
+      di.push([`Coverage / head`, `${fmt("area", d.coverageArea)} ${U("area")}`]);
+      di.push([`Remote (design) area`, `${fmt("area", d.designArea)} ${U("area")}`]);
+      di.push([`Design sprinklers`, String(dc.nHeads)]);
+      di.push([`Min flow / head`, `${fmt("flow", dc.minQ)} ${U("flow")}`]);
+    } else {
+      di.push([`Design sprinklers`, String(d.designSprinklers)]);
+    }
+    di.push([`Min remote pressure`, `${fmt("pressure", res.minP)} ${U("pressure")}`]);
+    di.push([`Governing K-factor`, fmt("kfac", kGov)]);
+    di.push([`Hose allowance`, `${fmt("flow", project.supply.hose)} ${U("flow")}`]);
+    di.push([`Velocity pressures`, res.velocityPressure ? "Included (Pn)" : "Not included"]);
+    const diColW = (MR - ML) / 2;
+    di.forEach((p, i) => {
+      const cx = ML + (i % 2) * diColW, ry = yy + Math.floor(i / 2) * 15;
+      doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...GRAY); doc.text(p[0] + ":", cx, ry);
+      doc.setFont("helvetica", "normal"); doc.setTextColor(...INK); doc.text(String(p[1]), cx + 128, ry);
+    });
+    yy += Math.ceil(di.length / 2) * 15 + 18;
+
+    /* --- Supply Analysis --- */
+    subHead("Supply Analysis", 96);
+    const sa = supplyCurvePoints(res, project);
+    const saCols = [["Source", ML + 6], ["Static", ML + 108], ["Residual", ML + 172], ["Test Flow", ML + 240],
+      ["Available", ML + 325], ["Demand", ML + 408], ["Required", ML + 488]];
+    doc.setFillColor(...SLATE); doc.rect(ML, yy - 10, MR - ML, 15, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(255, 255, 255);
+    saCols.forEach(([t, x]) => doc.text(t, x, yy));
+    yy += 18; doc.setTextColor(...INK); doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    const saVals = [project.supply.type === "pump" ? "PUMP" : "SUPPLY", fmt("pressure", sa.staticP), fmt("pressure", sa.testRes),
+      fmt("flow", sa.testFlow), fmt("pressure", res.supply.pAvail), fmt("flow", res.supply.demandQ), fmt("pressure", res.requiredPs)];
+    saCols.forEach(([t, x], i) => doc.text(String(saVals[i]), x, yy));
+    yy += 16;
+    const pass = res.supply.margin >= 0;
+    chip(ML + 6, yy, pass ? `PASS  ·  margin +${fmt("pressure", res.supply.margin)} ${U("pressure")}`
+      : `FAIL  ·  ${fmt("pressure", res.supply.margin)} ${U("pressure")} short`, pass ? OKC : BADC);
+    yy += 28;
+
+    /* --- Node Analysis --- */
+    subHead("Node Analysis", 88);
+    const naCols = [["Node", ML + 6], [`Elev (${U("length")})`, ML + 96], [`K (${U("kfac")})`, ML + 180],
+      [`Pressure (${U("pressure")})`, ML + 278], [`Discharge (${U("flow")})`, ML + 392], ["Notes", ML + 494]];
+    const naHead = () => {
+      doc.setFillColor(...SLATE); doc.rect(ML, yy - 10, MR - ML, 15, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(255, 255, 255);
+      naCols.forEach(([t, x]) => doc.text(t, x, yy));
+      yy += 17; doc.setTextColor(...INK); doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    };
+    naHead();
+    let zi = 0;
     for (const id of res.ids) {
-      if (yy > PH - 60) { footer(); yy = startPage("Flow Summary - NFPA"); doc.setFont("helvetica", "bold"); doc.setFontSize(8); naCols.forEach(([t, x]) => doc.text(t, x, yy)); yy += 4; doc.line(ML, yy, MR, yy); yy += 12; doc.setFont("helvetica", "normal"); }
+      if (yy > PH - 54) { footer(); yy = startPage("Flow Summary — NFPA"); naHead(); }
+      if (zi % 2 === 1) { doc.setFillColor(...ZEBRA); doc.rect(ML, yy - 9, MR - ML, 13, "F"); }
       const nd = res.N[id];
-      doc.text(nd.label, ML, yy);
-      doc.text(fmt("length", nd.z, 1), ML + 90, yy);
-      doc.text(nd.type === "sprinkler" ? fmt("kfac", nd.k) : "", ML + 175, yy);
-      doc.text(fmt("pressure", res.P[id], 2), ML + 260, yy);
-      doc.text(res.spr[id] > 0 ? fmt("flow", res.spr[id], 2) : "", ML + 345, yy);
-      doc.text(nd.type === "sprinkler" && nd.active ? "flowing" : nd.type, ML + 440, yy);
-      yy += 13;
+      doc.setTextColor(...INK);
+      doc.text(nd.label, ML + 6, yy);
+      doc.text(fmt("length", nd.z, 1), ML + 96, yy);
+      doc.text(nd.type === "sprinkler" ? fmt("kfac", nd.k) : "—", ML + 180, yy);
+      doc.text(fmt("pressure", res.P[id], 2), ML + 278, yy);
+      doc.text(res.spr[id] > 0 ? fmt("flow", res.spr[id], 2) : "—", ML + 392, yy);
+      doc.text(nd.type === "sprinkler" ? (nd.active ? "flowing" : "closed") : nd.type, ML + 494, yy);
+      yy += 13; zi++;
     }
     footer();
   }
 
-  /* ---------- 5 · FITTINGS USED + UNITS SUMMARY ---------- */
+  /* ---------- 6 · FITTINGS USED + UNITS SUMMARY ---------- */
   {
-    let yy = startPage("Fittings Used Summary");
+    let yy = startPage("Fittings & Units Summary");
     // which fitting types are actually used?
     const used = new Set();
     (project.pipes || []).forEach((p) => { for (const k in FITTINGS) if ((p.fittings?.[k] || 0) > 0) used.add(k); });
     const usedKeys = Object.keys(FITTINGS).filter((k) => used.has(k));
-    doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...INK);
-    doc.text("Fitting Legend", ML, yy); yy += 12;
-    doc.setFontSize(7.5);
-    doc.text("Abbrev.", ML, yy); doc.text("Name", ML + 44, yy);
-    const dCols = SCHED40.map((s, i) => ML + 200 + i * 34);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10.5); doc.setTextColor(...SLATE);
+    doc.text("Fitting Legend", ML, yy); yy += 6;
+    doc.setDrawColor(...AMBER); doc.setLineWidth(1.4); doc.line(ML, yy, ML + 86, yy); yy += 4;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+    doc.text("Equivalent pipe length (ft) by nominal size — Sched 40, C = 120", ML, yy + 8); yy += 18;
+    // header band
+    const dCols = SCHED40.map((s, i) => ML + 204 + i * 34);
+    doc.setFillColor(...SLATE); doc.rect(ML, yy - 10, MR - ML, 15, "F");
+    doc.setTextColor(255, 255, 255); doc.setFont("helvetica", "bold"); doc.setFontSize(7.5);
+    doc.text("Abbrev.", ML + 4, yy); doc.text("NFPA 13 Fitting", ML + 48, yy);
     SCHED40.forEach((s, i) => doc.text(s.nom.replace(/"/g, ""), dCols[i], yy, { align: "center" }));
-    yy += 4; doc.setLineWidth(0.6); doc.line(ML, yy, MR, yy); yy += 12;
-    doc.setFont("helvetica", "normal");
-    (usedKeys.length ? usedKeys : Object.keys(FITTINGS)).forEach((k) => {
-      doc.text(FIT_ABBR[k], ML, yy);
-      doc.text(`NFPA 13 ${FIT_NAME[k]}`, ML + 44, yy);
+    yy += 16; doc.setFont("helvetica", "normal"); doc.setFontSize(7.6); doc.setTextColor(...INK);
+    (usedKeys.length ? usedKeys : Object.keys(FITTINGS)).forEach((k, ri) => {
+      if (ri % 2 === 1) { doc.setFillColor(...ZEBRA); doc.rect(ML, yy - 9, MR - ML, 13, "F"); }
+      doc.setFont("helvetica", "bold"); doc.setTextColor(...AMBER); doc.text(FIT_ABBR[k], ML + 4, yy);
+      doc.setFont("helvetica", "normal"); doc.setTextColor(...INK); doc.text(FIT_NAME[k], ML + 48, yy);
       FITTINGS[k].vals.forEach((v, i) => doc.text(String(v), dCols[i], yy, { align: "center" }));
-      yy += 12;
+      yy += 13;
     });
-    yy += 18;
-    doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.text("Units Summary", ML, yy); yy += 16;
-    doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    yy += 22;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10.5); doc.setTextColor(...SLATE);
+    doc.text("Units Summary", ML, yy); yy += 6;
+    doc.setDrawColor(...AMBER); doc.setLineWidth(1.4); doc.line(ML, yy, ML + 86, yy); yy += 16;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); doc.setTextColor(...INK);
     const units = sys === "us"
-      ? [["Diameter Units", "Inches"], ["Length Units", "Feet"], ["Flow Units", "US Gallons per Minute"], ["Pressure Units", "Pounds per Square Inch"]]
-      : [["Diameter Units", "Millimeters"], ["Length Units", "Meters"], ["Flow Units", "Liters per Minute"], ["Pressure Units", "Bar"]];
-    units.forEach(([k, v]) => { doc.text(k, ML, yy); doc.text(v, ML + 150, yy); yy += 14; });
+      ? [["Diameter", "Inches"], ["Length", "Feet"], ["Flow", "US Gallons per Minute (gpm)"], ["Pressure", "Pounds per Square Inch (psi)"]]
+      : [["Diameter", "Millimeters"], ["Length", "Meters"], ["Flow", "Liters per Minute (L/min)"], ["Pressure", "Bar"]];
+    units.forEach(([k, v]) => { doc.setFont("helvetica", "bold"); doc.setTextColor(...GRAY); doc.text(k + ":", ML, yy); doc.setFont("helvetica", "normal"); doc.setTextColor(...INK); doc.text(v, ML + 90, yy); yy += 14; });
     yy += 14;
     doc.setFontSize(7.5); doc.setTextColor(...GRAY);
-    const note = "Note: Fitting Legend provides equivalent pipe lengths for fitting types of various diameters. Equivalent lengths shown are standard for Sched 40 pipe and C factors of 120; values are adjusted in the calculation for C factors other than 120 per NFPA 13.";
+    const note = "Note: The fitting legend lists equivalent pipe lengths for fitting types of various diameters. Equivalent lengths shown are standard for Sched 40 pipe and C factors of 120; values are adjusted in the calculation for C factors other than 120 per NFPA 13.";
     doc.text(doc.splitTextToSize(note, MR - ML), ML, yy);
     footer();
   }
