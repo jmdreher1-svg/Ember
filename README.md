@@ -6,6 +6,15 @@ dependency on the Claude.ai runtime. It includes:
 
 - the full EMBER frontend (Hazen-Williams nodal solver, gridded loops, US/metric,
   CMDA/CMSA/ESFR, density/area auto-calc, pump & hydrant supply records);
+- two **calculation modes** (toggle in the header):
+  - **Design** — set the density/area (or listing) and EMBER solves for the
+    required pressure and the safety margin against the supply;
+  - **Field eval** — for sites with *no* hydraulic design data (no as-built
+    placards). Enter the as-built piping, sprinkler K-factors, and the
+    water-supply flow test, mark the operating heads as flowing, and EMBER
+    finds the operating point where system demand meets the supply curve and
+    reports the **expected flow, end-head pressure, and delivered density
+    (gpm/ft²)** the installed system actually produces;
 - a **parametric Sizer** that lays out the whole system (branch lines × heads,
   branch/line spacing) and auto-selects the most-remote operating area from a
   selectable NFPA remote-area factor (1.0 / 1.2 / 1.4), highlighting it on the

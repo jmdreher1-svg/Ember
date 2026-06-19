@@ -303,16 +303,38 @@ function analyze(project) {
     return { ok: true, noDemand: true, looped, disconnected, ids, N, srcId, edges, geom, minP };
   }
 
-  // design search: source pressure so the min active-sprinkler discharge (normal)
-  // pressure == minP (warm-started)
-  let lo = minP, hi = minP + 3000, warm = null;
-  for (let i = 0; i < 64; i++) {
-    const mid = (lo + hi) / 2;
-    const r = solveNetwork(ctx, mid, warm, opts); warm = r.HGL;
-    const m = Math.min(...activeSpr.map((s) => r.Pn[s.id]));
-    if (m < minP) lo = mid; else hi = mid;
+  const mode = project.calcMode === "evaluate" ? "evaluate" : "design";
+  const hose = supply.hose || 0;
+  let requiredPs, warm = null;
+
+  if (mode === "evaluate") {
+    // FIELD / FORENSIC mode — no hydraulic design info available.
+    // The as-built piping + heads + the water supply fix the operating point:
+    // find the source pressure Ps where the pressure the supply can deliver at
+    // the resulting total demand equals Ps itself,
+    //     Ps = availAt( Q_system(Ps) + hose ).
+    // availAt() decreases with flow and Q_system increases with Ps, so the
+    // residual availAt(...) − Ps is strictly decreasing → bisection converges.
+    let lo = 0, hi = Math.max(availAt(0), 1);
+    for (let i = 0; i < 64; i++) {
+      const mid = (lo + hi) / 2;
+      const r = solveNetwork(ctx, mid, warm, opts); warm = r.HGL;
+      const resid = availAt(r.totalQ + hose) - mid;
+      if (resid > 0) lo = mid; else hi = mid;
+    }
+    requiredPs = (lo + hi) / 2;
+  } else {
+    // DESIGN search: source pressure so the min active-sprinkler discharge
+    // (normal) pressure == minP (warm-started)
+    let lo = minP, hi = minP + 3000;
+    for (let i = 0; i < 64; i++) {
+      const mid = (lo + hi) / 2;
+      const r = solveNetwork(ctx, mid, warm, opts); warm = r.HGL;
+      const m = Math.min(...activeSpr.map((s) => r.Pn[s.id]));
+      if (m < minP) lo = mid; else hi = mid;
+    }
+    requiredPs = (lo + hi) / 2;
   }
-  const requiredPs = (lo + hi) / 2;
   const sol = solveNetwork(ctx, requiredPs, warm, opts);
 
   const totalQ = activeSpr.reduce((a, s) => a + sol.spr[s.id], 0);
@@ -326,14 +348,30 @@ function analyze(project) {
       loss: e.g.R * Math.pow(Math.abs(flow), 1.85), vel: velocity(Math.abs(flow), e.g.d) };
   });
 
-  const demandQ = totalQ + (supply.hose || 0);
+  const demandQ = totalQ + hose;
   const pAvail = availAt(demandQ);
   const margin = pAvail - requiredPs;
 
+  // Delivered ("as-evaluated") metrics — what the installed system actually
+  // produces at the operating point. Primary outputs in evaluate mode; in
+  // design mode they simply confirm the remote head sits at minP.
+  const cov = project.design.coverageArea > 0 ? project.design.coverageArea : 0;
+  let endHeadId = null, endHeadP = Infinity, endHeadQ = 0, minHeadQ = Infinity;
+  for (const s of activeSpr) {
+    const p = sol.Pn[s.id];
+    if (p < endHeadP) { endHeadP = p; endHeadId = s.id; endHeadQ = sol.spr[s.id]; }
+    if (sol.spr[s.id] < minHeadQ) minHeadQ = sol.spr[s.id];
+  }
+  if (!isFinite(endHeadP)) { endHeadP = 0; minHeadQ = 0; }
+  const opArea = activeSpr.length * cov;
+  const densityAvg = cov > 0 ? (totalQ / activeSpr.length) / cov : null;  // mean gpm/ft² over the operating area
+  const densityMin = cov > 0 ? minHeadQ / cov : null;                     // worst (most-remote head) gpm/ft²
+
   return {
-    ok: true, looped, disconnected, ids, N, srcId, edges, geom,
-    P: sol.P, Pn: sol.Pn, spr: sol.spr, HGL: sol.HGL, requiredPs, totalQ, pipeRows, activeSpr, minP,
-    velocityPressure: opts.velocityPressure,
+    ok: true, mode, looped, disconnected, ids, N, srcId, edges, geom,
+    P: sol.P, Pn: sol.Pn, spr: sol.spr, HGL: sol.HGL, requiredPs, operatingPs: requiredPs,
+    totalQ, pipeRows, activeSpr, minP, velocityPressure: opts.velocityPressure,
+    endHeadId, endHeadP, endHeadQ, coverageArea: cov, opArea, densityAvg, densityMin,
     supply: { availAt, demandQ, pAvail, margin },
   };
 }
@@ -641,22 +679,34 @@ async function exportPDF(project, res, sys) {
   kv(sPairs);
 
   /* results summary */
-  sectionHead("Results Summary");
+  const evalMode = project.calcMode === "evaluate";
+  sectionHead(evalMode ? "As-Evaluated Results" : "Results Summary");
   const ok = res?.ok && !res.noDemand;
   const margin = ok ? res.supply.margin : null;
   const pass = margin != null && margin >= 0;
-  kv([
-    [`Required pressure`, ok ? `${fmt("pressure", res.requiredPs)} ${U("pressure")}` : "—"],
-    [`System demand`, ok ? `${fmt("flow", res.totalQ)} ${U("flow")} (+${fmt("flow", s.hose)} hose)` : "—"],
-    [`Available supply`, ok ? `${fmt("pressure", res.supply.pAvail)} ${U("pressure")} @ ${fmt("flow", res.supply.demandQ)} ${U("flow")}` : "—"],
-    [`Safety margin`, ok ? `${margin >= 0 ? "+" : ""}${fmt("pressure", margin)} ${U("pressure")}` : "—"],
-  ]);
-  if (ok) {
-    doc.setFillColor(...(pass ? [22, 163, 74] : [220, 38, 38]));
-    doc.roundedRect(MX, yy - 10, 150, 22, 3, 3, "F");
-    doc.setTextColor(255, 255, 255); doc.setFont("helvetica", "bold"); doc.setFontSize(11);
-    doc.text(pass ? "PASS — supply meets demand" : "FAIL — demand exceeds supply", MX + 8, yy + 5);
-    yy += 30;
+  if (evalMode) {
+    kv([
+      [`Expected flow`, ok ? `${fmt("flow", res.totalQ)} ${U("flow")} (+${fmt("flow", s.hose)} hose)` : "—"],
+      [`End-head pressure`, ok ? `${fmt("pressure", res.endHeadP)} ${U("pressure")}` : "—"],
+      [`Source pressure`, ok ? `${fmt("pressure", res.operatingPs)} ${U("pressure")} @ ${fmt("flow", res.supply.demandQ)} ${U("flow")}` : "—"],
+      [`Avg density`, ok && res.densityAvg != null ? `${fmt("density", res.densityAvg)} ${U("density")}` : "—"],
+      [`Remote-head density`, ok && res.densityMin != null ? `${fmt("density", res.densityMin)} ${U("density")}` : "—"],
+      [`Operating area`, ok ? `${fmt("area", res.opArea)} ${U("area")}` : "—"],
+    ]);
+  } else {
+    kv([
+      [`Required pressure`, ok ? `${fmt("pressure", res.requiredPs)} ${U("pressure")}` : "—"],
+      [`System demand`, ok ? `${fmt("flow", res.totalQ)} ${U("flow")} (+${fmt("flow", s.hose)} hose)` : "—"],
+      [`Available supply`, ok ? `${fmt("pressure", res.supply.pAvail)} ${U("pressure")} @ ${fmt("flow", res.supply.demandQ)} ${U("flow")}` : "—"],
+      [`Safety margin`, ok ? `${margin >= 0 ? "+" : ""}${fmt("pressure", margin)} ${U("pressure")}` : "—"],
+    ]);
+    if (ok) {
+      doc.setFillColor(...(pass ? [22, 163, 74] : [220, 38, 38]));
+      doc.roundedRect(MX, yy - 10, 150, 22, 3, 3, "F");
+      doc.setTextColor(255, 255, 255); doc.setFont("helvetica", "bold"); doc.setFontSize(11);
+      doc.text(pass ? "PASS — supply meets demand" : "FAIL — demand exceeds supply", MX + 8, yy + 5);
+      yy += 30;
+    }
   }
 
   /* schematic image */
@@ -744,6 +794,7 @@ async function exportHydraCalcPDF(project, res, sys) {
   const company = project.company || "DGA Consulting";
   const job = project.name || "Hydraulic Calculation";
   const dateStr = project.reportDate || today();
+  const evalMode = project.calcMode === "evaluate";
   let pageNo = 0;
 
   /* a small stylized flame mark (matches the on-screen brand) */
@@ -803,7 +854,7 @@ async function exportHydraCalcPDF(project, res, sys) {
   doc.setFont("helvetica", "normal"); doc.setFontSize(13); doc.setTextColor(...GRAY);
   doc.text("Hydraulic Calculation Report", PW / 2, 256, { align: "center" });
   doc.setFontSize(9.5); doc.setTextColor(...AMBER);
-  doc.text(`${project.systemType || "CMDA"}  ·  NFPA 13 methodology`, PW / 2, 272, { align: "center" });
+  doc.text(evalMode ? "FIELD EVALUATION  ·  as-built · NFPA 13 methodology" : `${project.systemType || "CMDA"}  ·  NFPA 13 methodology`, PW / 2, 272, { align: "center" });
   doc.setTextColor(...INK);
 
   // project information card
@@ -835,26 +886,37 @@ async function exportHydraCalcPDF(project, res, sys) {
     iy += rowH;
   });
 
-  // results banner (KPIs + pass/fail)
+  // results banner (KPIs)
   const okCover = res?.ok && !res.noDemand;
   if (okCover) {
-    const margin = res.supply.margin, pass = margin >= 0;
     const by = jbY + jbH + 30;
-    chip(PW / 2 - 95, by, pass ? "PASS — SUPPLY MEETS DEMAND" : "FAIL — DEMAND EXCEEDS SUPPLY", pass ? OKC : BADC, [255, 255, 255], 190);
-    const kpis = [
-      ["REQUIRED", `${fmt("pressure", res.requiredPs)} ${U("pressure")}`, SLATE],
-      ["DEMAND", `${fmt("flow", res.totalQ)} ${U("flow")}`, SLATE],
-      ["AVAILABLE", `${fmt("pressure", res.supply.pAvail)} ${U("pressure")}`, SLATE],
-      ["MARGIN", `${margin >= 0 ? "+" : ""}${fmt("pressure", margin)} ${U("pressure")}`, pass ? OKC : BADC],
-    ];
+    let kpis;
+    if (evalMode) {
+      chip(PW / 2 - 70, by, "AS-EVALUATED RESULTS", SLATE, [255, 255, 255], 140);
+      kpis = [
+        ["EXPECTED FLOW", `${fmt("flow", res.totalQ)} ${U("flow")}`, SLATE],
+        ["END-HEAD P", `${fmt("pressure", res.endHeadP)} ${U("pressure")}`, SLATE],
+        ["SOURCE P", `${fmt("pressure", res.operatingPs)} ${U("pressure")}`, SLATE],
+        ["DENSITY", res.densityAvg != null ? `${fmt("density", res.densityAvg)}` : "—", AMBER],
+      ];
+    } else {
+      const margin = res.supply.margin, pass = margin >= 0;
+      chip(PW / 2 - 95, by, pass ? "PASS — SUPPLY MEETS DEMAND" : "FAIL — DEMAND EXCEEDS SUPPLY", pass ? OKC : BADC, [255, 255, 255], 190);
+      kpis = [
+        ["REQUIRED", `${fmt("pressure", res.requiredPs)} ${U("pressure")}`, SLATE],
+        ["DEMAND", `${fmt("flow", res.totalQ)} ${U("flow")}`, SLATE],
+        ["AVAILABLE", `${fmt("pressure", res.supply.pAvail)} ${U("pressure")}`, SLATE],
+        ["MARGIN", `${margin >= 0 ? "+" : ""}${fmt("pressure", margin)} ${U("pressure")}`, pass ? OKC : BADC],
+      ];
+    }
     const cw = jbW / 4, ky = by + 22;
     kpis.forEach(([k, v, col], i) => {
       const cx = jbX + i * cw;
-      doc.setFillColor(...(i === 3 ? (pass ? [236, 253, 243] : [254, 242, 242]) : ZEBRA));
+      doc.setFillColor(...(i === 3 && !evalMode ? (res.supply.margin >= 0 ? [236, 253, 243] : [254, 242, 242]) : ZEBRA));
       doc.roundedRect(cx + 3, ky, cw - 6, 48, 3, 3, "F");
-      doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(7); doc.setTextColor(...GRAY);
       doc.text(k, cx + cw / 2, ky + 16, { align: "center" });
-      doc.setFont("helvetica", "bold"); doc.setFontSize(13); doc.setTextColor(...col);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(12.5); doc.setTextColor(...col);
       doc.text(v, cx + cw / 2, ky + 35, { align: "center" });
     });
     doc.setTextColor(...INK);
@@ -888,12 +950,14 @@ async function exportHydraCalcPDF(project, res, sys) {
       [`C2 — Residual (${U("pressure")})`, fmt("pressure", sp.testRes)],
       [`C2 — Test flow (${U("flow")})`, fmt("flow", sp.testFlow)],
     ], TEAL);
-    drawCard(ML + cardW + 16, "System Demand", [
+    drawCard(ML + cardW + 16, evalMode ? "System Demand (as-built)" : "System Demand", [
       [`D1 — Elevation (${U("pressure")})`, fmt("pressure", sp.d1Elev)],
       [`D2 — System (${U("flow")} @ ${U("pressure")})`, `${fmt("flow", sp.d2Flow)} @ ${fmt("pressure", sp.d2P)}`],
       [`Hose allowance (${U("flow")})`, fmt("flow", s.hose)],
       [`D3 — Demand (${U("flow")})`, fmt("flow", sp.d3Flow)],
-      [`Safety margin (${U("pressure")})`, sp.margin == null ? "—" : `${sp.margin >= 0 ? "+" : ""}${fmt("pressure", sp.margin)}`],
+      evalMode
+        ? [`Operating pressure (${U("pressure")})`, fmt("pressure", res.operatingPs)]
+        : [`Safety margin (${U("pressure")})`, sp.margin == null ? "—" : `${sp.margin >= 0 ? "+" : ""}${fmt("pressure", sp.margin)}`],
     ], AMBER);
     yy += cardH + 22;
 
@@ -1113,25 +1177,41 @@ async function exportHydraCalcPDF(project, res, sys) {
       doc.setDrawColor(...AMBER); doc.setLineWidth(1.4); doc.line(ML, yy, ML + (w || 110), yy); yy += 14;
     };
 
-    /* --- Hydraulic Design Information --- */
-    subHead("Hydraulic Design Information", 168);
+    /* --- Hydraulic Design Information / As-Evaluated Results --- */
     const d = project.design;
     const kGov = res.activeSpr?.length ? Math.min(...res.activeSpr.map((x) => x.k)) : 5.6;
-    const di = [["System type", project.systemType]];
-    if (project.systemType === "CMDA" && d.mode === "density") {
-      const dc = densityCalc(d, kGov);
-      di.push([`Density`, `${fmt("density", d.density)} ${U("density")}`]);
+    const di = [];
+    if (evalMode) {
+      subHead("As-Evaluated Results", 150);
+      di.push([`Expected flow`, `${fmt("flow", res.totalQ)} ${U("flow")}`]);
+      di.push([`End-head pressure`, `${fmt("pressure", res.endHeadP)} ${U("pressure")}`]);
+      di.push([`Source pressure`, `${fmt("pressure", res.operatingPs)} ${U("pressure")}`]);
+      di.push([`Avg density`, res.densityAvg != null ? `${fmt("density", res.densityAvg)} ${U("density")}` : "—"]);
+      di.push([`Remote-head density`, res.densityMin != null ? `${fmt("density", res.densityMin)} ${U("density")}` : "—"]);
       di.push([`Coverage / head`, `${fmt("area", d.coverageArea)} ${U("area")}`]);
-      di.push([`Remote (design) area`, `${fmt("area", d.designArea)} ${U("area")}`]);
-      di.push([`Design sprinklers`, String(dc.nHeads)]);
-      di.push([`Min flow / head`, `${fmt("flow", dc.minQ)} ${U("flow")}`]);
+      di.push([`Operating area`, `${fmt("area", res.opArea)} ${U("area")}`]);
+      di.push([`Flowing heads`, String(res.activeSpr.length)]);
+      di.push([`Governing K-factor`, fmt("kfac", kGov)]);
+      di.push([`Hose allowance`, `${fmt("flow", project.supply.hose)} ${U("flow")}`]);
+      di.push([`Velocity pressures`, res.velocityPressure ? "Included (Pn)" : "Not included"]);
     } else {
-      di.push([`Design sprinklers`, String(d.designSprinklers)]);
+      subHead("Hydraulic Design Information", 168);
+      di.push(["System type", project.systemType]);
+      if (project.systemType === "CMDA" && d.mode === "density") {
+        const dc = densityCalc(d, kGov);
+        di.push([`Density`, `${fmt("density", d.density)} ${U("density")}`]);
+        di.push([`Coverage / head`, `${fmt("area", d.coverageArea)} ${U("area")}`]);
+        di.push([`Remote (design) area`, `${fmt("area", d.designArea)} ${U("area")}`]);
+        di.push([`Design sprinklers`, String(dc.nHeads)]);
+        di.push([`Min flow / head`, `${fmt("flow", dc.minQ)} ${U("flow")}`]);
+      } else {
+        di.push([`Design sprinklers`, String(d.designSprinklers)]);
+      }
+      di.push([`Min remote pressure`, `${fmt("pressure", res.minP)} ${U("pressure")}`]);
+      di.push([`Governing K-factor`, fmt("kfac", kGov)]);
+      di.push([`Hose allowance`, `${fmt("flow", project.supply.hose)} ${U("flow")}`]);
+      di.push([`Velocity pressures`, res.velocityPressure ? "Included (Pn)" : "Not included"]);
     }
-    di.push([`Min remote pressure`, `${fmt("pressure", res.minP)} ${U("pressure")}`]);
-    di.push([`Governing K-factor`, fmt("kfac", kGov)]);
-    di.push([`Hose allowance`, `${fmt("flow", project.supply.hose)} ${U("flow")}`]);
-    di.push([`Velocity pressures`, res.velocityPressure ? "Included (Pn)" : "Not included"]);
     const diColW = (MR - ML) / 2;
     di.forEach((p, i) => {
       const cx = ML + (i % 2) * diColW, ry = yy + Math.floor(i / 2) * 15;
@@ -1144,7 +1224,7 @@ async function exportHydraCalcPDF(project, res, sys) {
     subHead("Supply Analysis", 96);
     const sa = supplyCurvePoints(res, project);
     const saCols = [["Source", ML + 6], ["Static", ML + 108], ["Residual", ML + 172], ["Test Flow", ML + 240],
-      ["Available", ML + 325], ["Demand", ML + 408], ["Required", ML + 488]];
+      ["Available", ML + 325], ["Demand", ML + 408], [evalMode ? "Source P" : "Required", ML + 488]];
     doc.setFillColor(...SLATE); doc.rect(ML, yy - 10, MR - ML, 15, "F");
     doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(255, 255, 255);
     saCols.forEach(([t, x]) => doc.text(t, x, yy));
@@ -1153,9 +1233,13 @@ async function exportHydraCalcPDF(project, res, sys) {
       fmt("flow", sa.testFlow), fmt("pressure", res.supply.pAvail), fmt("flow", res.supply.demandQ), fmt("pressure", res.requiredPs)];
     saCols.forEach(([t, x], i) => doc.text(String(saVals[i]), x, yy));
     yy += 16;
-    const pass = res.supply.margin >= 0;
-    chip(ML + 6, yy, pass ? `PASS  ·  margin +${fmt("pressure", res.supply.margin)} ${U("pressure")}`
-      : `FAIL  ·  ${fmt("pressure", res.supply.margin)} ${U("pressure")} short`, pass ? OKC : BADC);
+    if (evalMode) {
+      chip(ML + 6, yy, `OPERATING POINT  ·  ${fmt("flow", res.supply.demandQ)} ${U("flow")} @ ${fmt("pressure", res.operatingPs)} ${U("pressure")}`, SLATE);
+    } else {
+      const pass = res.supply.margin >= 0;
+      chip(ML + 6, yy, pass ? `PASS  ·  margin +${fmt("pressure", res.supply.margin)} ${U("pressure")}`
+        : `FAIL  ·  ${fmt("pressure", res.supply.margin)} ${U("pressure")} short`, pass ? OKC : BADC);
+    }
     yy += 28;
 
     /* --- Node Analysis --- */
@@ -1397,7 +1481,7 @@ function sampleProject() {
     name: "Sample — twin branch lines", projectNumber: "DGA-2025-001",
     client: "Sample Client LLC", location: "—", drawingNumber: "FP-101", preparedBy: "", peNumber: "",
     company: "DGA Consulting", reportDate: today(), systemDesc: "Wet-pipe sprinkler system, ordinary hazard.",
-    units: "us", systemType: "CMDA",
+    units: "us", systemType: "CMDA", calcMode: "design",
     design: { mode: "density", hazard: "OH2", density: 0.20, coverageArea: 130, designArea: 1500,
       designSprinklers: 12, listingPressure: 50, minPressure: 7, velocityPressure: false },
     sizer: defaultSizer(),
@@ -1596,16 +1680,60 @@ function ProjectPanel({ project, update }) {
   );
 }
 
-/* ---- Design basis (system type + density/area or listing) ---- */
+/* ---- Design basis (system type + density/area or listing) ----
+   In "design" mode this sets the required pressure at the remote sprinkler.
+   In "evaluate" (field) mode the density/area are unknown OUTPUTS — the panel
+   collects only the coverage/head and reports what the as-built system delivers. */
 function DesignBasisPanel({ project, update, res }) {
   const { sys } = useUnits();
   const d = project.design;
+  const evalMode = project.calcMode === "evaluate";
+  const ok = res?.ok && !res.noDemand;
   const setD = (patch) => update({ design: { ...d, ...patch } });
   const setHazard = (h) => { const hz = HAZARDS[h]; setD({ hazard: h, ...(h !== "CUS" ? { density: hz.density, designArea: hz.area, coverageArea: hz.cov } : {}) }); };
   const kGov = res?.activeSpr?.length ? Math.min(...res.activeSpr.map((s) => s.k)) : 5.6;
   const dc = densityCalc(d, kGov);
   const activeCount = project.nodes.filter((n) => n.type === "sprinkler" && n.active).length;
   const targetCount = project.systemType === "CMDA" ? dc.nHeads : d.designSprinklers;
+
+  if (evalMode) {
+    return (
+      <div className="card">
+        <div className="head"><ClipboardList size={15} color="var(--gold)" /><h3>Field evaluation basis</h3>
+          <span className="desc">No design data assumed — results come from the as-built system + supply</span></div>
+        <div className="body">
+          <div className="grid3">
+            <div className="field"><label>Coverage / head ({lab(sys, "area")})</label>
+              <NumField q="area" value={d.coverageArea} onChange={(v) => setD({ coverageArea: v })} /></div>
+          </div>
+          <div className="note" style={{ marginTop: 10 }}><Settings2 size={14} style={{ flex: "none", marginTop: 1 }} />
+            <span>Build the as-built piping (Network or Sizer tab), enter each sprinkler's <b>K-factor</b>, and the water-supply flow test (Water supply tab). Mark the operating sprinklers as <b>flowing</b> — that set is the operating area. EMBER finds the operating point where the system demand meets the supply curve, then reports the delivered flow, end-head pressure, and density. <b>Coverage / head</b> is the floor area each head protects (≈ branch spacing × line spacing); it converts head flow into density (gpm/ft²).</span></div>
+          {ok ? (
+            <div className="derived">
+              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow)}</span><span className="l">expected flow ({lab(sys, "flow")})</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "pressure", res.endHeadP), UPREC[sys].pressure)}</span><span className="l">end-head pressure ({lab(sys, "pressure")})</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--water)" }}>{num(toDisp(sys, "pressure", res.operatingPs), UPREC[sys].pressure)}</span><span className="l">source pressure ({lab(sys, "pressure")})</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--gold)" }}>{res.densityAvg != null ? num(toDisp(sys, "density", res.densityAvg), UPREC[sys].density) : "—"}</span><span className="l">avg density ({lab(sys, "density")})</span></div>
+              <div className="d"><span className="v">{res.densityMin != null ? num(toDisp(sys, "density", res.densityMin), UPREC[sys].density) : "—"}</span><span className="l">remote-head density ({lab(sys, "density")})</span></div>
+              <div className="d"><span className="v">{activeCount}</span><span className="l">flowing heads</span></div>
+            </div>
+          ) : (
+            <div className="note" style={{ marginTop: 10 }}><AlertTriangle size={14} color="var(--gold)" style={{ flex: "none", marginTop: 1 }} />
+              <span>Mark the operating sprinklers as flowing (Network tab) to run the evaluation.</span></div>
+          )}
+          <div className="field" style={{ marginTop: 14 }}>
+            <label>Velocity pressures</label>
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              <Toggle on={!!d.velocityPressure} onChange={(v) => setD({ velocityPressure: v })} />
+              <span style={{ fontSize: 12, color: "var(--mut)" }}>
+                {d.velocityPressure ? "On — discharge uses normal pressure Pₙ = Pₜ − Pᵥ" : "Off — total pressure at each orifice (more conservative)"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="card">
@@ -1986,16 +2114,26 @@ function SizerPanel({ project, update, res }) {
 
       {res?.ok && !res.noDemand && (
         <div className="card">
-          <div className="head"><Gauge size={15} color="var(--water)" /><h3>Sizer result</h3>
+          <div className="head"><Gauge size={15} color="var(--water)" /><h3>{project.calcMode === "evaluate" ? "Field evaluation result" : "Sizer result"}</h3>
             <span className="desc">{res.looped ? "Gridded / looped — full nodal solution" : "Tree solution"}</span></div>
           <div className="body">
-            <div className="derived">
-              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow)}</span><span className="l">system demand ({lab(sys, "flow")})</span></div>
-              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure)}</span><span className="l">required pressure ({lab(sys, "pressure")})</span></div>
-              <div className="d"><span className="v" style={{ color: "var(--water)" }}>{num(toDisp(sys, "pressure", res.supply.pAvail), UPREC[sys].pressure)}</span><span className="l">available ({lab(sys, "pressure")})</span></div>
-              <div className="d"><span className="v" style={{ color: margin == null ? "var(--mut)" : pass ? "var(--ok)" : "var(--danger)" }}>{margin == null ? "—" : (margin >= 0 ? "+" : "") + num(toDisp(sys, "pressure", margin), UPREC[sys].pressure)}</span><span className="l">margin ({lab(sys, "pressure")})</span></div>
-              <div className="d"><span className="v" style={{ color: maxVel != null && maxVel > 32 ? "var(--danger)" : "var(--gold)" }}>{maxVel == null ? "—" : num(toDisp(sys, "vel", maxVel), UPREC[sys].vel)}</span><span className="l">max velocity ({lab(sys, "vel")})</span></div>
-            </div>
+            {project.calcMode === "evaluate" ? (
+              <div className="derived">
+                <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow)}</span><span className="l">expected flow ({lab(sys, "flow")})</span></div>
+                <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "pressure", res.endHeadP), UPREC[sys].pressure)}</span><span className="l">end-head pressure ({lab(sys, "pressure")})</span></div>
+                <div className="d"><span className="v" style={{ color: "var(--water)" }}>{num(toDisp(sys, "pressure", res.operatingPs), UPREC[sys].pressure)}</span><span className="l">source pressure ({lab(sys, "pressure")})</span></div>
+                <div className="d"><span className="v" style={{ color: "var(--gold)" }}>{res.densityAvg != null ? num(toDisp(sys, "density", res.densityAvg), UPREC[sys].density) : "—"}</span><span className="l">avg density ({lab(sys, "density")})</span></div>
+                <div className="d"><span className="v" style={{ color: maxVel != null && maxVel > 32 ? "var(--danger)" : "var(--gold)" }}>{maxVel == null ? "—" : num(toDisp(sys, "vel", maxVel), UPREC[sys].vel)}</span><span className="l">max velocity ({lab(sys, "vel")})</span></div>
+              </div>
+            ) : (
+              <div className="derived">
+                <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow)}</span><span className="l">system demand ({lab(sys, "flow")})</span></div>
+                <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure)}</span><span className="l">required pressure ({lab(sys, "pressure")})</span></div>
+                <div className="d"><span className="v" style={{ color: "var(--water)" }}>{num(toDisp(sys, "pressure", res.supply.pAvail), UPREC[sys].pressure)}</span><span className="l">available ({lab(sys, "pressure")})</span></div>
+                <div className="d"><span className="v" style={{ color: margin == null ? "var(--mut)" : pass ? "var(--ok)" : "var(--danger)" }}>{margin == null ? "—" : (margin >= 0 ? "+" : "") + num(toDisp(sys, "pressure", margin), UPREC[sys].pressure)}</span><span className="l">margin ({lab(sys, "pressure")})</span></div>
+                <div className="d"><span className="v" style={{ color: maxVel != null && maxVel > 32 ? "var(--danger)" : "var(--gold)" }}>{maxVel == null ? "—" : num(toDisp(sys, "vel", maxVel), UPREC[sys].vel)}</span><span className="l">max velocity ({lab(sys, "vel")})</span></div>
+              </div>
+            )}
             {maxVel != null && maxVel > 32 && (
               <div className="note" style={{ marginTop: 10 }}><AlertTriangle size={14} color="var(--gold)" style={{ flex: "none" }} />
                 <span>Peak velocity exceeds ~32 ft/s — consider upsizing the affected pipe group.</span></div>
@@ -2226,7 +2364,7 @@ function SupplyPanel({ project, update, res }) {
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Line type="linear" dataKey="p" name="Available supply" stroke="#2BD4D9" strokeWidth={2.5} dot={false} />
                 <ReferenceDot x={round(Math.pow(toDisp(sys, "flow", res.supply.demandQ), HW_N), 4)} y={round(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure)}
-                  r={6} fill="#FF7A1A" stroke="#FFB066" strokeWidth={2} label={{ value: "Demand", position: "top", fill: "#FF7A1A", fontSize: 11 }} />
+                  r={6} fill="#FF7A1A" stroke="#FFB066" strokeWidth={2} label={{ value: project.calcMode === "evaluate" ? "Operating point" : "Demand", position: "top", fill: "#FF7A1A", fontSize: 11 }} />
               </ComposedChart>
             </ResponsiveContainer>
           </div></div>
@@ -2244,6 +2382,26 @@ function ResultsPanel({ res }) {
   if (res.noDemand) return <div className="card"><div className="body"><div className="note"><AlertTriangle size={15} color="var(--gold)" style={{ flex: "none" }} /><span>No flowing sprinklers. Mark the sprinklers in your design area as flowing to run a demand calculation.</span></div></div></div>;
   return (
     <>
+      {res.mode === "evaluate" && (
+        <div className="card">
+          <div className="head"><Gauge size={15} color="var(--fire)" /><h3>As-evaluated results</h3>
+            <span className="desc">Delivered by the as-built system at the supply's operating point</span></div>
+          <div className="body">
+            <div className="derived">
+              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow)}</span><span className="l">expected flow ({lab(sys, "flow")})</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--fire)" }}>{num(toDisp(sys, "pressure", res.endHeadP), UPREC[sys].pressure)}</span><span className="l">end-head pressure ({lab(sys, "pressure")}){res.endHeadId ? ` · ${res.N[res.endHeadId].label}` : ""}</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--water)" }}>{num(toDisp(sys, "pressure", res.operatingPs), UPREC[sys].pressure)}</span><span className="l">source pressure ({lab(sys, "pressure")})</span></div>
+              <div className="d"><span className="v" style={{ color: "var(--gold)" }}>{res.densityAvg != null ? num(toDisp(sys, "density", res.densityAvg), UPREC[sys].density) : "—"}</span><span className="l">avg density ({lab(sys, "density")})</span></div>
+              <div className="d"><span className="v">{res.densityMin != null ? num(toDisp(sys, "density", res.densityMin), UPREC[sys].density) : "—"}</span><span className="l">remote-head density ({lab(sys, "density")})</span></div>
+              <div className="d"><span className="v">{num(toDisp(sys, "area", res.opArea), UPREC[sys].area)}</span><span className="l">operating area ({lab(sys, "area")})</span></div>
+            </div>
+            {res.densityAvg == null && (
+              <div className="note" style={{ marginTop: 10 }}><Settings2 size={14} color="var(--gold)" style={{ flex: "none", marginTop: 1 }} />
+                <span>Set <b>coverage / head</b> in the Field evaluation basis (Network tab) to report density (gpm/ft²).</span></div>
+            )}
+          </div>
+        </div>
+      )}
       <div className="card">
         <div className="head"><Gauge size={15} color="var(--water)" /><h3>Node pressures</h3><span className="desc">{res.activeSpr.length} flowing sprinklers</span></div>
         <div style={{ overflowX: "auto" }}>
@@ -2297,17 +2455,27 @@ async function callClaude(userMsg, system) {
 function summarizeForAI(project, res, sys) {
   const L = []; const u = (q) => lab(sys, q); const f = (q, v) => (v == null || isNaN(v) ? "—" : toDisp(sys, q, v).toFixed(UPREC[sys][q]));
   L.push(`Project: ${project.name} (${project.projectNumber}) — ${project.company}`);
-  L.push(`System type: ${project.systemType}. Units: ${sys === "us" ? "US" : "metric"}.`);
-  L.push(`Design: remote min pressure ${f("pressure", res?.minP)} ${u("pressure")}.`);
-  if (project.systemType === "CMDA" && project.design.mode === "density")
-    L.push(`Density/area: ${f("density", project.design.density)} ${u("density")} over ${f("area", project.design.designArea)} ${u("area")}.`);
+  const evalMode = project.calcMode === "evaluate";
+  L.push(`System type: ${project.systemType}. Units: ${sys === "us" ? "US" : "metric"}. Mode: ${evalMode ? "FIELD EVALUATION (deriving delivered flow/pressure/density from the as-built system + supply; no design data given)" : "design"}.`);
+  if (!evalMode) {
+    L.push(`Design: remote min pressure ${f("pressure", res?.minP)} ${u("pressure")}.`);
+    if (project.systemType === "CMDA" && project.design.mode === "density")
+      L.push(`Density/area: ${f("density", project.design.density)} ${u("density")} over ${f("area", project.design.designArea)} ${u("area")}.`);
+  } else {
+    L.push(`Coverage / head: ${f("area", project.design.coverageArea)} ${u("area")}.`);
+  }
   const s = project.supply;
   L.push(`Supply: ${s.type}${s.identifier ? " (" + s.identifier + ")" : ""}. ` +
     (s.type === "pump" ? `pump ${f("flow", s.pump.ratedFlow)} ${u("flow")} @ ${f("pressure", s.pump.ratedPressure)} ${u("pressure")}, churn ${f("pressure", s.pump.churnPressure)}.`
       : `static ${f("pressure", s.static)} / residual ${f("pressure", s.residual)} @ ${f("flow", s.testFlow)} ${u("flow")}.`) + ` Hose ${f("flow", s.hose)} ${u("flow")}.`);
   L.push("Nodes: " + project.nodes.map((n) => `${n.label}[${n.type}${n.type === "sprinkler" ? ` K${n.k}${n.active ? " flow" : ""}` : ""}]`).join(", "));
   if (res?.ok && !res.noDemand) {
-    L.push(`RESULTS: required ${f("pressure", res.requiredPs)} ${u("pressure")}, demand ${f("flow", res.totalQ)} ${u("flow")} (+hose), available ${f("pressure", res.supply.pAvail)} ${u("pressure")}, margin ${f("pressure", res.supply.margin)} ${u("pressure")}.`);
+    if (evalMode) {
+      L.push(`RESULTS (as-evaluated at the operating point): expected flow ${f("flow", res.totalQ)} ${u("flow")} (+hose ${f("flow", res.supply.demandQ - res.totalQ)} → ${f("flow", res.supply.demandQ)} total), source/operating pressure ${f("pressure", res.operatingPs)} ${u("pressure")}, end-head (most remote) pressure ${f("pressure", res.endHeadP)} ${u("pressure")}.`);
+      L.push(`Delivered density: avg ${f("density", res.densityAvg)} ${u("density")}, remote-head min ${f("density", res.densityMin)} ${u("density")} over ${f("area", res.opArea)} ${u("area")} (${res.activeSpr.length} flowing heads).`);
+    } else {
+      L.push(`RESULTS: required ${f("pressure", res.requiredPs)} ${u("pressure")}, demand ${f("flow", res.totalQ)} ${u("flow")} (+hose), available ${f("pressure", res.supply.pAvail)} ${u("pressure")}, margin ${f("pressure", res.supply.margin)} ${u("pressure")}.`);
+    }
     L.push(res.looped ? "Network is gridded (looped)." : "Network is a tree.");
     const fast = res.pipeRows.filter((r) => r.vel > 20).map((r) => `${r.label} ${r.vel.toFixed(1)}ft/s`);
     if (fast.length) L.push("High velocity: " + fast.join(", "));
@@ -2425,10 +2593,12 @@ export default function App() {
   const [pdfStyle, setPdfStyle] = useState("nfpa");   // nfpa (HydraCALC worksheet) | report (branded)
 
   const sys = project.units || "us";
+  const evalMode = project.calcMode === "evaluate";
   const update = (patch) => setProject((p) => ({ ...p, ...patch }));
   const res = useMemo(() => { try { return analyze(project); } catch (e) { return { error: String(e.message || e) }; } }, [project]);
   const margin = res?.ok && !res.noDemand ? res.supply.margin : null;
   const pass = margin != null && margin >= 0;
+  const okRes = res?.ok && !res.noDemand;
 
   const doExport = async () => {
     setPdfBusy(true); setPdfErr("");
@@ -2459,6 +2629,11 @@ export default function App() {
             <button className={sys === "us" ? "on" : ""} onClick={() => update({ units: "us" })}>US</button>
             <button className={sys === "si" ? "on" : ""} onClick={() => update({ units: "si" })}>Metric</button>
           </div>
+          <div className="useg" role="group" aria-label="Calculation mode"
+            title="Design — set density/area, solve for required pressure.  Field eval — derive delivered flow, end-head pressure & density from the as-built piping + water supply (no design data needed).">
+            <button className={!evalMode ? "on" : ""} onClick={() => update({ calcMode: "design" })}>Design</button>
+            <button className={evalMode ? "on" : ""} onClick={() => update({ calcMode: "evaluate" })}>Field eval</button>
+          </div>
           <button className="btn" onClick={() => setProject(sampleProject())}><FilePlus2 size={14} /> Sample</button>
           <button className="btn" onClick={() => setProject(blankProject())}><FilePlus2 size={14} /> New</button>
           <SaveLoad project={project} setProject={setProject} />
@@ -2470,20 +2645,37 @@ export default function App() {
           <button className="btn primary" onClick={doExport} disabled={pdfBusy}>{pdfBusy ? <Loader2 size={14} className="spin" /> : <FileText size={14} />} Export PDF</button>
         </div>
 
-        <div className="kpis">
-          <div className="kpi fire"><div className="lab eyebrow"><Gauge size={13} color="var(--fire)" /> Required pressure</div>
-            <div className="val">{res?.ok && !res.noDemand ? num(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure) : "—"}<span className="unit">{lab(sys, "pressure")}</span></div>
-            <div className="meta">at the supply connection</div></div>
-          <div className="kpi fire"><div className="lab eyebrow"><Flame size={13} color="var(--fire)" /> System demand</div>
-            <div className="val">{res?.ok && !res.noDemand ? num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow) : "—"}<span className="unit">{lab(sys, "flow")}</span></div>
-            <div className="meta">{res?.ok && !res.noDemand ? `+${num(toDisp(sys, "flow", project.supply.hose), UPREC[sys].flow)} hose` : "no flowing heads"}</div></div>
-          <div className="kpi water"><div className="lab eyebrow"><Droplets size={13} color="var(--water)" /> Available supply</div>
-            <div className="val">{res?.ok && !res.noDemand ? num(toDisp(sys, "pressure", res.supply.pAvail), UPREC[sys].pressure) : "—"}<span className="unit">{lab(sys, "pressure")}</span></div>
-            <div className="meta">at {res?.ok && !res.noDemand ? num(toDisp(sys, "flow", res.supply.demandQ), UPREC[sys].flow) : "—"} {lab(sys, "flow")}</div></div>
-          <div className="kpi"><div className="lab eyebrow"><CheckCircle2 size={13} color={pass ? "var(--ok)" : "var(--danger)"} /> Safety margin</div>
-            <div className="val" style={{ color: margin == null ? "var(--mut)" : pass ? "var(--ok)" : "var(--danger)" }}>{margin == null ? "—" : (margin >= 0 ? "+" : "") + num(toDisp(sys, "pressure", margin), UPREC[sys].pressure)}<span className="unit">{lab(sys, "pressure")}</span></div>
-            <div className="meta">{margin == null ? "—" : <span className={`tag ${pass ? "ok" : "bad"}`}>{pass ? <><CheckCircle2 size={11} /> Supply meets demand</> : <><AlertTriangle size={11} /> Demand exceeds supply</>}</span>}</div></div>
-        </div>
+        {evalMode ? (
+          <div className="kpis">
+            <div className="kpi fire"><div className="lab eyebrow"><Flame size={13} color="var(--fire)" /> Expected flow</div>
+              <div className="val">{okRes ? num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow) : "—"}<span className="unit">{lab(sys, "flow")}</span></div>
+              <div className="meta">{okRes ? `+${num(toDisp(sys, "flow", project.supply.hose), UPREC[sys].flow)} hose → ${num(toDisp(sys, "flow", res.supply.demandQ), UPREC[sys].flow)} total` : "no flowing heads"}</div></div>
+            <div className="kpi fire"><div className="lab eyebrow"><Gauge size={13} color="var(--fire)" /> End-head pressure</div>
+              <div className="val">{okRes ? num(toDisp(sys, "pressure", res.endHeadP), UPREC[sys].pressure) : "—"}<span className="unit">{lab(sys, "pressure")}</span></div>
+              <div className="meta">{okRes ? `most-remote head${res.endHeadId ? " · " + res.N[res.endHeadId].label : ""}` : "—"}</div></div>
+            <div className="kpi water"><div className="lab eyebrow"><Droplets size={13} color="var(--water)" /> Delivered density</div>
+              <div className="val">{okRes && res.densityAvg != null ? num(toDisp(sys, "density", res.densityAvg), UPREC[sys].density) : "—"}<span className="unit">{lab(sys, "density")}</span></div>
+              <div className="meta">{okRes && res.densityMin != null ? `remote min ${num(toDisp(sys, "density", res.densityMin), UPREC[sys].density)}` : "set coverage / head"}</div></div>
+            <div className="kpi water"><div className="lab eyebrow"><Droplets size={13} color="var(--water)" /> Source pressure</div>
+              <div className="val">{okRes ? num(toDisp(sys, "pressure", res.operatingPs), UPREC[sys].pressure) : "—"}<span className="unit">{lab(sys, "pressure")}</span></div>
+              <div className="meta">operating point on supply curve</div></div>
+          </div>
+        ) : (
+          <div className="kpis">
+            <div className="kpi fire"><div className="lab eyebrow"><Gauge size={13} color="var(--fire)" /> Required pressure</div>
+              <div className="val">{okRes ? num(toDisp(sys, "pressure", res.requiredPs), UPREC[sys].pressure) : "—"}<span className="unit">{lab(sys, "pressure")}</span></div>
+              <div className="meta">at the supply connection</div></div>
+            <div className="kpi fire"><div className="lab eyebrow"><Flame size={13} color="var(--fire)" /> System demand</div>
+              <div className="val">{okRes ? num(toDisp(sys, "flow", res.totalQ), UPREC[sys].flow) : "—"}<span className="unit">{lab(sys, "flow")}</span></div>
+              <div className="meta">{okRes ? `+${num(toDisp(sys, "flow", project.supply.hose), UPREC[sys].flow)} hose` : "no flowing heads"}</div></div>
+            <div className="kpi water"><div className="lab eyebrow"><Droplets size={13} color="var(--water)" /> Available supply</div>
+              <div className="val">{okRes ? num(toDisp(sys, "pressure", res.supply.pAvail), UPREC[sys].pressure) : "—"}<span className="unit">{lab(sys, "pressure")}</span></div>
+              <div className="meta">at {okRes ? num(toDisp(sys, "flow", res.supply.demandQ), UPREC[sys].flow) : "—"} {lab(sys, "flow")}</div></div>
+            <div className="kpi"><div className="lab eyebrow"><CheckCircle2 size={13} color={pass ? "var(--ok)" : "var(--danger)"} /> Safety margin</div>
+              <div className="val" style={{ color: margin == null ? "var(--mut)" : pass ? "var(--ok)" : "var(--danger)" }}>{margin == null ? "—" : (margin >= 0 ? "+" : "") + num(toDisp(sys, "pressure", margin), UPREC[sys].pressure)}<span className="unit">{lab(sys, "pressure")}</span></div>
+              <div className="meta">{margin == null ? "—" : <span className={`tag ${pass ? "ok" : "bad"}`}>{pass ? <><CheckCircle2 size={11} /> Supply meets demand</> : <><AlertTriangle size={11} /> Demand exceeds supply</>}</span>}</div></div>
+          </div>
+        )}
 
         <div className="tabs">{tabs.map((t) => <button key={t.id} className={`tab ${tab === t.id ? "active" : ""}`} onClick={() => setTab(t.id)}><t.icon size={14} /> {t.label}</button>)}</div>
 
